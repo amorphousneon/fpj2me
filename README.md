@@ -1053,6 +1053,7 @@ Vendored third-party code keeps its own licenses: `vendor/miniz.LICENSE`,
 
 <a name="usbcast"></a>
 ## 21. USB screen casting (Round 10)
+    python3 ~/Downloads/usbcast_host.py --kde
 
 `UsbCast.jar` turns the it2163 into a live 128x160 USB monitor for a
 Linux laptop. It boots from the launcher menu like any game jar.
