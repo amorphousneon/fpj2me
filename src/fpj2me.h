@@ -86,6 +86,9 @@ JRef  ref_alloc(u8 type, u32 payload, void *clazz);
 void  gc_run(void);                 /* mark & sweep                     */
 void  gc_pin(JRef r);               /* native-held ref across an alloc  */
 void  gc_unpin(int n);
+void  handle_rebind(JRef h, JRef rep); /* 'new String(bytes..)' ctor: the
+                                      caller's handle moves onto the real
+                                      T_ARR_C string (see heap.c)       */
 void  gc_frame_hold(struct Frame *f); /* keep an outer frame chain    */
 void  gc_frame_release(int n);       /* GC-visible while a nested    */
                                       /* interp_call runs (paint/keys  */

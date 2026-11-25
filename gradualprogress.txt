@@ -6,9 +6,14 @@ ARMv5TE, no FPU (soft-float via libgcc), 4 MB PSRAM, 128x160 RGB565
 LCD, launched by sdboot/fpmenu from a FAT32 microSD card on top of
 Ilya Kurdyukov's fpdoom framework (Unlicense).
 
-STATUS: M0+M1 complete + launcher menu. Full 202-opcode CLDC
-interpreter, classfile parser, mark&sweep GC, native registry (250+
-methods incl. the Nokia Sound/DeviceControl set), tinfl jar reader, stb
+STATUS: M0+M1 complete + launcher menu + USB SCREEN CAST. Full
+202-opcode CLDC interpreter, classfile parser, mark&sweep GC, native
+registry (359 methods incl. the Nokia Sound/DeviceControl set, the
+full CLDC 1.1 / Java 5 wrapper boxing, the COMPLETE CLDC 1.1
+java.lang.Math, the standard java.lang exception stub ctors and the
+Round 10 comm:usb GCF pipe + DirectGraphics.drawPixels RGB565 fast
+blit), tinfl jar reader,
+stb
 PNG->RGB565 blitter, RMS, silent media, CATCHABLE Java exceptions,
 <clinit> static initialization, cooperative Thread.start(), MIDP-2.0
 JAD property chain (sibling .jad overrides the jar manifest, RFC-822
@@ -19,10 +24,640 @@ reprogrammed ONCE at boot from the app + STOCK-fpdoom refresh flow:
 no per-frame panel register access, the previous frame retired by
 polling the RAW LCDC end-of-capture bit before every submit —
 fpj_lcdc_wait_frame), PORTRAIT D-PAD (fpdoom's --rotate keypad bits
-cleared: physical UP = Canvas UP), and an
-on-phone jar picker (fp_menu.c). 172/172 host checks pass
-(170 unit + 2 stack boots, tests/run.sh); target files compile against
-the real fpdoom headers.
+cleared: physical UP = Canvas UP), real Graphics arcs
+(clipRect/drawArc/fillArc/drawRoundRect), and an
+on-phone jar picker (fp_menu.c). USB SCREEN CASTING: UsbCast.jar
+turns the phone into a live 128x160 monitor driven from Linux over the
+fpdoom raw-USB bulk pipe (round (10) below), and COLD-BOOT USB
+ENUMERATION (round (11) below): fp_usb_init() replays the OEM
+firmware's own SC6531E UDC cold init (AHB power island + LDO_USB D+
+pull-up power cycle around usb_init()) so a sdboot-booted phone shows
+up in lsusb as 1782:4d00 the moment it is plugged in. FULL-SPEED
+BULK STREAMING (round (12) below): the comm:usb fill loop is a
+tight spin — no timer-quantized sleeps while payload streams —
+so a 40,960-byte frame lands in tens of milliseconds instead of
+>5 seconds and the cast runs at the USB 1.1 ceiling (~12-20 fps)
+instead of 0.1-0.2 fps. 314/314 host checks pass (311 unit + 3
+stack boots, tests/run.sh); target files compile against the real
+fpdoom headers.
+
+2026-11-25 (12) FULL-SPEED USB BULK STREAMING (0.1-0.2 fps ->
+12-20 fps; kills the "usbcast: ACK timeout — resending" spam).
+Round 11 gave a perfect link — cold-boot enumeration, the 'R'
+handshake, KDE Wayland casting all worked — but frame streaming
+crawled: 0.1-0.2 fps and the frame counter jumping 2 -> 3 -> 9 ->
+12 -> 13 -> 15. THREE stacked root causes:
+
+STEP 1 — THE DIAGNOSIS:
+
+  (a) TIMER-TICK STALL IN THE BULK RX FILL (the big one). A
+      40,969-byte frame is 641 64-byte bulk packets. usb_fill()
+      (src/natives.c, the comm:usb InputStream fill loop) called
+      fp_sleep_ms(2) after EVERY partial drain — and on target
+      fp_sleep_ms() -> fpdoom's sys_wait_ms() busy-waits on the
+      hardware timer at 0x8100300c, where a 2 ms request
+      quantizes to a FULL timer tick (~10-16 ms, user-measured on
+      the real phone). Hundreds of ring refills later that is
+      >5 seconds per frame; the 2048-byte usb_buf ring sits
+      starved, EP2 OUT NAKs packet after packet, and the host
+      watches its 5 s ACK_TIMEOUT_MS expire mid-transfer.
+
+  (b) HOST ACK TIMEOUT -> FRAME DESYNC. Once the timeout fired,
+      usbcast_host.py resent a NEW "FPJ2" header into the middle
+      of the still-arriving old frame, so UsbCast.jar burned CPU
+      scanning byte-by-byte for the next sync point — a slow
+      spiral on BOTH sides of the wire.
+
+  (c) PIPEWIRE QUEUEING LATENCY. While usbcast_host.py blocked on
+      the phone's 'K' ACK, GStreamer's pipewiresrc kept pushing
+      desktop frames into an unbounded queue in front of
+      videoconvert; fdsink fed us the PAST, frame after frame.
+
+STEP 2 — THE PHONE FIX (src/natives.c usb_fill(), three-phase
+  state machine; fp_platform.c Round-12 section documents the
+  transport contract; fpdoom files, the Round 7 LCD pipeline and
+  Round 11 fp_usb_init() untouched):
+
+    ACTIVE (first byte of the read seen, rem > 0): tight spin over
+      fp_usb_read(dst+got, len-got) — NO fp_sleep_ms at all. Each
+      call is already "spin-poll usb_check_int() + usb_read(p, rem,
+      0)": fpdoom's usb_read(..., USB_NOWAIT) services the UDC
+      interrupt handler (EP0 control transfers included) whenever
+      the 2 KB ring has >= 64 bytes free, then drains the ring to
+      EMPTY before returning. One loop pass is microseconds on
+      the 208 MHz ARM926 — the ring never wedges full, the host
+      NAKs at most one pass, and full-speed bulk (64-byte packets
+      every ~60 us of wire time) is drained essentially as it
+      arrives.
+
+    KEYPAD/EXIT POLLING at a ~16 ms cadence (FPJ_USB_KEY_POLL_MS,
+      gated on fp_time_ms() == sys_timer_ms()): midp_paint_pump()
+      plus a re-check of the close() abort flag every ~16 ms of
+      streaming. The exit key (RSOFT) still breaks any blocked
+      bulk read — bounded by one poll period — without
+      per-packet pump overhead. The abort check at the loop top
+      plus the post-pump recheck close the race where keyPressed
+      -> close() lands mid-pump.
+
+    IDLE (not one byte of this read yet): the ONLY remaining
+      yield — midp_paint_pump() + fp_sleep_ms(2). This is the
+      sanctioned pre-first-byte wait AND it keeps Round 11's EP0
+      enumeration service alive (fpj_usb_pump() runs from the
+      sleep path while no reader owns the ring). The ~10-16 ms
+      quantization here costs nothing: it is the inter-frame gap
+      (the host only starts the next frame after our 'K').
+
+  Why the loop lives in natives.c and not fp_platform.c: the host
+  check mock pipe is synchronous — a platform-side blocking
+  primitive would need a parallel mock implementation that the
+  host tests would never actually execute against the real loop.
+  usb_fill() in natives.c compiles VERBATIM for host and target,
+  so the 311 host checks exercise the exact production code. The
+  fp_usb_read() platform primitive keeps its signature and its
+  drain-to-empty semantics (documented in platform.h).
+
+STEP 3 — THE HOST FIX (tools/usbcast_host.py; base = the user's
+  own Round 11 edit, PRESERVED: the merged --kde D-Bus ScreenCast
+  portal mode, the --portrait flag, the per-interface kernel-
+  driver detach loop and the EBUSY-safe set_configuration()):
+
+    gst-launch-1.0 pipewiresrc fd=.. path=.. ! video/x-raw
+      ! queue max-size-buffers=1 leaky=downstream
+      ! videoconvert ! videoscale ! video/x-raw,format=RGB,...
+      ! fdsink fd=1
+
+  The leaky queue is the host half of the fix: while cast_loop()
+  blocks on the phone's 'K' ACK, pipewiresrc keeps producing; the
+  queue (max-size-buffers=1, leaky=downstream) DROPS the older
+  queued buffers as new ones arrive, so fdsink always emits the
+  freshest desktop frame the moment we are ready to send. No
+  backlog, no stale frames, no latency creep.
+
+STEP 4 — UsbCast.jar VERIFIED (Task 2; the Round 10 design held
+  — and is now PINNED by hostcheck so it cannot regress):
+  - the 40,960-byte payload moves as ONE bulk
+    InputStream.read(buf, 9, 40960) into the pre-allocated
+    40,978-byte byte[] (readN -> in.read([BII) -> the native
+    fills the WHOLE request); NEVER single-byte read() loops for
+    payload data (only the 4-byte "FPJ2" magic scan reads
+    byte-wise, and only while re-syncing)
+  - the blit is DirectGraphics.drawPixels(buf, null, 9, 128, ...) ->
+    gfx_draw_rgb565: one memcpy per row from the reused Java
+    array into the RGB565 framebuffer; zero per-frame allocation
+  - hostcheck pins "usbfast: payload arrives as 2 full-size bulk
+    reads ([BII)" == 2 for the two-frame boot test
+
+STEP 5 — VERIFICATION (tests/run.sh, 314/314 = 311 unit + 3 stack
+  boots; was 309/309 at Round 11; zero regressions):
+  - NEW drip mode in the hostcheck USB mock: a 40,969-byte frame
+    is released 128 bytes per fp_usb_read() call, each call
+    advancing the virtual clock 1 ms — a deterministic replay of
+    the 64-byte bulk wire cadence (the host fp_time_ms()/
+    fp_sleep_ms() mocks share one virtual clock).
+  - usbfast pins: (1) "bulk RX never sleeps while payload streams"
+    — a counter in the host fp_sleep_ms() stub fires when a sleep
+    happens while RX data is queued; must stay 0. COUNTERFACTUAL
+    CHECK DONE: reverting usb_fill() to the Round 11
+    sleep-per-gap code makes exactly this check FAIL (verified
+    before shipping the fix). (2) "mid-frame exit key aborts the
+    payload read" — a RSOFT press armed at drip call 64 (~7 KB
+    into the payload, ~64 ms virtual) must abort the bulk read
+    via the ~16 ms keypad poll: frames == 0, wire == "R Q". This
+    also proves the ACTIVE-phase poll actually fires mid-frame.
+    (3) "drip-mode boot ends cleanly" — fpj2me_boot returns 0.
+  - run.sh ordering bug FIXED: UsbCast.jar is now generated and
+    copied to /tmp/fpj2me/ BEFORE the hostcheck run (the old
+    order left a fresh /tmp without the jar — 9 usbcast checks
+    failed spuriously on a clean sandbox).
+  - Target-config compile sweep: all 15 app sources compile clean
+    against the real fpdoom headers with -DCHIP=1 -DLIBC_SDIO=3
+    (no ARM cross toolchain in this sandbox; the hostcheck build
+    compiles natives.c verbatim).
+  - tools/usbcast_host.py --selftest: ALL OK (header, RGB565
+    encoder, both rotation paths, numpy/pure-python parity).
+
+STEP 6 — ON-PHONE ACCEPTANCE TEST (for the real hardware):
+  1. make LIBC_SDIO=3 CHIP=1 TOOLCHAIN=arm-<prefix>  -> fpj2me.bin
+  2. copy to the microSD, cold-boot into it via sdboot
+  3. tools/usbcast_host.py --kde (or --demo), pick a window
+  4. EXPECT: the fps line on stderr settles at ~12-20 fps with
+     NO "ACK timeout — resending" lines; frame counter is
+     sequential (n, n+1, n+2, ...), never jumping.
+  5. Exit key mid-frame: the phone returns to the launcher within
+     ~20-30 ms of the press, host prints "phone exited (exit
+     key). Bye."
+  If fps is still low but ACKs arrive: check for a mid-loop
+  midp_paint_pump doing heavy repaints (should not happen — no
+  repaint is pending while a frame streams). If "ACK timeout"
+  still appears: the host pipewiresrc queue is growing — confirm
+  the leaky=downstream element is present (gst-launch-1.0 --help
+  or the stderr from step 3).
+
+2026-11-25 (11) COLD-BOOT USB ENUMERATION — fpj2me.bin booted from
+microSD via sdboot NEVER appeared in lsusb/dmesg when plugged into
+Linux (Round 10's pipe only worked when the app itself had been
+loaded over USB by the FDL host). Root cause had TWO independent
+parts, both diagnosed from the OEM firmware (flash.bin) + the leaked
+SC6531E/M Device Specification:
+
+STEP 1 — THE DIAGNOSIS (sources: stock flash.bin XIP-disassembled,
+  cross-checked against the SC6531E DS, both provided by the user):
+
+  (a) usbio.c line 22-24 says it out loud: "not necessary, because
+      USB is already initialized by the bootloader". That is true
+      ONLY for the LIBC_SDIO<3 FDL path — the host loaded us over
+      USB, so BootROM/FDL1 left the UDC powered and armed. entry.c
+      calls usb_init() exclusively inside `#if LIBC_SDIO < 3`
+      (entry.c:171); with LIBC_SDIO=3 (mandatory for sdboot) NOTHING
+      in the image ever touches USB. usb_check_int() polls INTC1
+      raw bit 5 (0x80001004) — polling machinery is fine, it is the
+      bring-up that is missing.
+
+  (b) Even calling usb_init() alone would hang or stay invisible:
+      cold, the SC6531E USB island is POWERED DOWN. Three gates are
+      off: the AHB power island (USB sits on the AHB matrix at
+      0x90000000-0x97FFFFFF, DS 5.2.1), the module control bit, and
+      LDO_USB33 — the analog-die LDO that biases the PHY AND the
+      1.5 k D+ pull-up. No pull-up = no attach = the host's hub
+      sees literally nothing (not even "unknown device").
+
+  (c) THE OEM SEQUENCE (recovered from the phone's own firmware:
+      flash.bin, XIP NOR so file offset == vaddr; UDC cold init at
+      0x29FFA, called from the UDC-service wrappers at 0x2A0AA/
+      0x2A2B2; LDO helper at 0x29B04; ADI helpers 0x6E52/0x6ED2):
+
+        [0x20501080] = 0x10       ; AHB power-enable SET, bit 4 = USB
+        [0x8B000220] |= 0x20      ; GR module-control bit 5
+        <notify + delay 300 ms>   ; island settle (0x2A020: counter
+                                 ; busy-wait of 300 ms units)
+        [0x90000000] |= 2         ; USB_CTRL.SELF_PWR (DS 6.1.4.2.1:
+                                 ; "software should write 1 ... since
+                                 ; our USB device is always self-
+                                 ; powered")
+        [0x90000000] |= 1         ; USB_CTRL.USB_EN
+        EP0 (0x64): max-pkt 8 + INT_CLR 0x3FFF + INT_CTRL |= 1<<8
+                   + buffer-ready bit 28   (0x2A036-0x2A054 + 0x29B2A)
+        EP1 (0xC0), EP2 (0x100), EP3 (0x140), EP4 (0x180) armed with
+                   the same bit vocabulary as fpdoom's usb_init()
+                   (0x29B66/0x29BC6/0x29C0C/0x29C56)
+        LDO_USB_REG0 bit0 = 0     ; 0x29B04(r0=1): adi RMW
+                                 ; 0x8200147C: LDO ON -> D+ pull-up
+                                 ; powered -> THE HOST SEES ATTACH
+      The LDO helper is a plain ADI read-modify-write: r0!=0 clears
+      bit 0 (power on), r0==0 sets bit 0 (power down — used by the
+      charger path at 0xC612 and as the FIRST call of cold init,
+      i.e. a soft-disconnect while reconfiguring).
+
+      Datasheet cross-checks: LDO_USB_REG0 = Glb-reg offset 0x7C,
+      analog die, ARM-side ADI window 0x82001400+ (DS 5.2.6.1/13.1.1
+      register map, 13.1.1.32 bit fields: bit0 LDO_USB_PD 1=pd/0=on,
+      bit1 SHPT_PD, bit8 LP_EN_SW; LDO_USB_REG1 0x80 = voltage,
+      default 0x12 is fine). FIFOs at +0x80000 (6.1.4.1) match
+      usbio.c. Pin_CTRL_REG2 usb_uart1_sel (DS 3.5.2.3) defaults to
+      0 = USB DP/DM stay USB — the stock fw never touches it, and
+      neither do we. The stock fw also never writes Pin_CTRL_REG0
+      USB_PORN (0x402A0000 bit 0) — left at its reset default, so we
+      leave it too.
+
+STEP 2 — fp_usb_init() (src/fp_platform.c, Round 11 section):
+  Idempotent, no fpdoom file touched:
+    1. [0x20501080] = 1<<4 and [0x8B000220] |= 1<<5  (idempotent
+       SET/RMW: safe even under a live FDL session)
+    2. sys_wait_ms(300)  — the stock settle delay
+    3. ADOPT-IF-LIVE: if USB_CTRL.USB_EN reads 1, entry.c's FDL path
+       already armed the controller and the host session is live ->
+       return success WITHOUT touching LDO or endpoints (never
+       reset endpoints under a host).
+    4. cold path: adi_write(0x8200147C, read|1)  — LDO off
+       (soft-disconnect while re-arming, exactly the stock order)
+    5. USB_CTRL |= SELF_PWR, then |= USB_EN
+    6. usb_init()  — fpdoom's proven EP0/EP2/EP3 arming, which is
+       register-for-register the stock sequence (max-pkt 8/64/64,
+       per-EP int enables, INT_CLR 0x3FFF, buffer-ready, EP-enable,
+       TIMEOUT_LMT=15) AND zeroes the 2 KB RX ring
+    7. adi_write(0x8200147C, read & ~1)  — LDO on: D+ pull-up
+       powered, host sees 1782:4d00 and enumerates
+
+STEP 3 — ENUMERATION SERVICE (the second half of the fix):
+  usbio.c pumps EP0 control transfers ONLY from usb_read()/
+  usb_getchar(). A host enumerating while the UI idles (launcher
+  menu, MIDlet event wait) would time out reading descriptors.
+  fp_sleep_ms() now calls fpj_usb_pump() first: a 1-byte
+  NON-BLOCKING drain while the RX ring is empty (usb_read with 0
+  queued bytes services EP0/EP2/EP3 interrupts and returns 0,
+  stealing nothing; when data IS pending the pump stands down —
+  a 1-byte read could steal a queued byte and the reader owns the
+  ring). Coverage: launcher menu loops fp_sleep_ms(10), MIDlet
+  event waits fp_sleep_ms(20), blocked comm:usb reads pump
+  themselves via fp_usb_read.
+
+STEP 4 — CALL SITES:
+  - target_main.c main(): once at boot, right after the banner +
+    event drain — lsusb shows 1782:4d00 immediately, no MIDlet
+    needed.
+  - nat_Connector_open("comm:usb"): lazy, idempotent fallback for
+    any harness that skips target_main; on -1 it throws the
+    MIDP-mandated ConnectionNotFoundException.
+
+STEP 5 — VERIFICATION (tests/run.sh, 309/309):
+  - hostcheck mock fp_usb_init(): counts sequences EXECUTED vs
+    ADOPTED (the fpj_usb_up semantics); fp_usb_mock_reset() makes
+    the device cold again.
+  - usbcold tests: (1) first comm:usb open (via Tst.run33) runs the
+    cold-init exactly once; (2) second open still streams 110 with
+    the sequence count UNCHANGED (adopt, never re-init under a live
+    link); (3) forced -1 -> open throws and the pending exception
+    IS javax/microedition/io/ConnectionNotFoundException (class
+    name checked, not just non-null); (4) next open recovers.
+  - boot_jar.c: fp_usb_init stub (permanent success — the pipe is
+    preloaded synthetic frames).
+  - Target compile check: fp_platform.c + target_main.c compile
+    clean against the real fpdoom headers (round 11 code emits zero
+    new warnings); no ARM toolchain in this sandbox, so the on-phone
+    validation is the lsusb/dmesg test below.
+  - ZERO regressions: 306 unit PASS lines + 3 stack-boot PASS lines,
+    RESULT: ALL PASS (was 300+3 before Round 11).
+
+STEP 6 — ON-PHONE ACCEPTANCE TEST (for the real hardware):
+  1. make LIBC_SDIO=3 CHIP=1 TOOLCHAIN=arm-<prefix>  -> fpj2me.bin
+  2. copy to the microSD, cold-boot the phone into it via sdboot
+     (battery pull first, so the USB island is truly cold)
+  3. plug the micro-USB cable into a Linux box
+  4. EXPECT: `lsusb` lists `ID 1782:4d00`; `dmesg` shows
+     "new full-speed USB device" + "New USB device found, idVendor=1782
+     idProduct=4d00" (enumeration is done by the kernel; the device
+     is vendor-class so no driver binds — that is correct)
+  5. tools/usbcast_host.py --demo then streams exactly as in
+     Round 10 (same udev rule, same FPJ2 protocol).
+  If lsusb still shows nothing: the island power or the LDO write
+  is not landing — check the GR/ADI base (0x8B000220/0x8200147C are
+  SC6531E-layout addresses, correct for CHIP=1).
+
+2026-11-25 (10) USB SCREEN CASTING — the phone as a live 128x160
+LINUX MONITOR (UsbCast.jar + tools/usbcast_host.py). Goal: run a
+lightweight MIDlet inside fpj2me that receives raw RGB565 frames over
+USB and displays them in real time, with ZERO per-pixel math and ZERO
+per-frame allocation in Java bytecode on the 208 MHz ARM926.
+
+STEP 1 — WHAT FPDOOM'S USB LAYER ACTUALLY IS (inspected, not assumed):
+  fpdoom compiles usbio.c into our image (SYS_SRCS in
+  build_sc6531.make) and exposes exactly three primitives:
+    int  usb_read(void *dst, unsigned len, int wait)
+    int  usb_write(const void *src, unsigned len)
+    int  usb_getchar(int wait)
+  The DEVICE side was already configured by the phone's bootloader:
+  vendor-class 0xFF, VID 0x1782 / PID 0x4D00, 64-byte bulk packets,
+  EP OUT 0x02 (phone receives) and EP IN 0x83 (phone transmits), RX
+  side a 2 KB ring in usb_buf. With LIBC_SDIO=3 nothing else in the
+  image touches USB (the libc_server handshake and _debug_msg are
+  compiled out in libc.c), so the pipe belongs to the MIDlet while a
+  StreamConnection holds it. We deliberately NEVER call usb_init():
+  re-running the endpoint init would reset live state under an
+  enumerated host.
+  HOST SIDE: no kernel driver binds to a vendor-class device, so the
+  Linux sender talks to the endpoints directly with libusb (pyusb),
+  NOT /dev/ttyACM* or /dev/ttyUSB* — there is no CDC ACM function.
+  USB permissions: install the udev rule below once, or use sudo.
+
+STEP 2 — THE TRANSPORT, PLUMBED LIKE THE REST OF fpj2me:
+  platform.h gained a 4-call HAL surface; fp_platform.c implements
+  them over usbio (fp_usb_read = one non-blocking drain that also
+  services EP2 interrupts, fp_usb_write = blocking 64-byte-chunked
+  TX, fp_usb_available, fp_usb_reset). hostcheck provides the same
+  surface as a mock FIFO. NO LCD CODE WAS TOUCHED (the Round 7
+  pipeline stays locked).
+  src/natives.c maps it into MIDP:
+    javax.microedition.io.Connector.open("comm:usb")
+      -> StreamConnection stub object (any other URL throws the
+         MIDP-mandated ConnectionNotFoundException; Connector.
+         openInputStream/openOutputStream convenience forms too)
+    sc.openInputStream()  -> java/io/InputStream  (slot 4 = usb mode)
+    sc.openOutputStream() -> java/io/OutputStream (slot 0 = usb mode)
+    OutputStream.write(I)/([B)/([BII) -> the wire (the 1-byte ACK)
+  EXIT-KEY LIVENESS (the "always break out of a USB wait" law): the
+  InputStream carries an abort flag (slot 5); close() sets it and
+  every blocked native read polls it while pumping the frame pump
+  every ~2 ms — so keyPressed(-7) -> in.close() interrupts a read
+  from the INSIDE, UsbCast returns, notifyDestroyed hands control
+  back to the launcher menu. No battery pull, ever. Reads never
+  return a spurious -1: -1 is reserved for close()/link-EOF (a slow
+  host is never mistaken for a dead one).
+  THE FAST BLIT — com.nokia.mid.ui.DirectGraphics.drawPixels:
+    drawPixels(byte[] pixels, null, offset, scanlength, x, y, w, h,
+               0, 565 /*TYPE_USHORT_565_RGB*/)
+  is now a registered native: for the identity manipulation it calls
+  the new gfx_draw_rgb565 (src/midp_graphics.c) — one memcpy per
+  clipped row from the Java byte[] straight into the target's RGB565
+  buffer. 40,960 bytes per frame with no per-pixel math, no
+  allocation, no GC churn (full fidelity too: an exact 0x0000 stays
+  0x0000 — no PX_TRANS remap; a cast frame may legitimately be pure
+  black). fpj2me's documented interpretation of the byte[] overload:
+  `offset` is a BYTE offset (the cast payload starts at buf[9],
+  behind the 9-byte header) and pairs are little-endian — exactly the
+  wire format, so the copy is layout-identical on the ARM926.
+  Other formats/manipulations/non-null masks degrade to silent
+  no-ops per project policy.
+
+STEP 3 — THE FRAME PROTOCOL (self-syncing, ACK-paced):
+  host -> phone, per frame:
+    "FPJ2" | u16le width=128 | u16le height=160 | u8 flags=0
+           | 128*160*2 bytes little-endian RGB565 payload
+  phone -> host:
+    'R' (0x52) once, when UsbCast boots ("ready")
+    'K' (0x4B) after each frame is DISPLAYED (the host waits for it:
+    backpressure paced to exactly what the phone can render)
+    'Q' (0x51) when the MIDlet exits (exit key) — the host stops
+  Mid-stream connects resync trivially: the MIDlet scans byte-by-
+  byte for the "FPJ2" magic and only accepts 128x160/flags=0
+  headers (anything else drops back to the scan). USB NAK
+  backpressure (2 KB ring) means the host physically CANNOT
+  overflow the phone — a frame is either delivered whole or the
+  hardware holds the rest.
+
+STEP 4 — UsbCast.jar (tools/make_usbcast_jar.py, javac-free):
+  UsbCast (MIDlet) + CastScr (Canvas), hand-assembled classfiles in
+  the make_test_jar.py style. CastScr allocates ONCE in <init>: a
+  40,978-byte frame buffer (9 header + 40,960 payload), a mutable
+  Image, its Graphics, and the DirectGraphics handle — then the run
+  loop does only control flow: scan magic, readN(4,5) header,
+  validate 128x160, readN(9,40960) payload, dg.drawPixels(buf,
+  null, 9, 128, 0, 0, 128, 160, 0, 565), repaint() +
+  serviceRepaints(), out.write('K'). paint() draws the status screen
+  ("USB CAST / WAITING FOR USB") until the first frame arrives, then
+  the latest frame via drawImage. keyPressed(-7) = closed=true +
+  in.close() = the guaranteed exit. The jar boots from the launcher
+  menu like any game (copy it into the fpj2me SD folder next to the
+  others; fp_menu.c lists every *.jar in the directory).
+
+STEP 5 — tools/usbcast_host.py (the LINUX sender):
+  python3 + pyusb (sudo pacman -S python-pyusb libusb); numpy used
+  if present (0.05 ms/frame RGB24->RGB565), pure-Python LUT
+  fallback keeps up with the USB ceiling regardless.
+    --demo    animated bars + moving box + FPS counter (link test
+              with zero capture setup)
+    --stdin   raw RGB24 128x160 (or 160x128 + --rotate cw/ccw —
+              rotation via numpy rot90 or a per-pixel strided copy)
+    --fps N   rate cap (default: as fast as the phone ACKs; USB
+              full-speed bulk tops out ~12-20 fps at this size)
+    --device VID:PID override, --no-hello, --selftest (encoder +
+              rotation roundtrips, no hardware needed)
+  Ready-to-run capture one-liners (also in --help):
+    KDE Plasma Wayland (PipeWire):
+      gst-launch-1.0 pipewiresrc ! videoconvert ! videoscale \
+        ! video/x-raw,format=RGB,width=128,height=160 ! fdsink fd=1 \
+        | ./tools/usbcast_host.py --stdin
+    any video file:
+      ffmpeg -i video.mp4 -vf scale=128:160 -pix_fmt rgb24 \
+        -f rawvideo - | ./tools/usbcast_host.py --stdin
+    landscape source rotated into the portrait panel:
+      ffmpeg -i video.mp4 -vf transpose=1,scale=128:160 \
+        -pix_fmt rgb24 -f rawvideo - | ./tools/usbcast_host.py --stdin
+    X11 session:
+      ffmpeg -f x11grab -video_size 1920x1080 -i :0 \
+        -vf scale=128:160 -pix_fmt rgb24 -f rawvideo - \
+        | ./tools/usbcast_host.py --stdin
+  udev rule (one-time, /etc/udev/rules.d/51-fpj2me.rules):
+    SUBSYSTEM=="usb", ATTRS{idVendor}=="1782", \
+    ATTRS{idProduct}=="4d00", MODE="0666"
+  then `sudo udevadm control --reload-rules` and re-plug the phone.
+
+STEP 6 — VERIFICATION (tests/run.sh, 303/303):
+  - run33 (test.jar): Connector.open("http:zz") throws
+    ConnectionNotFoundException through the new io stub chain
+    (caught in bytecode); open("comm:usb") -> StreamConnection ->
+    InputStream/OutputStream; read of mock-fed bytes + 'K' ACK
+    captured on the mock wire.
+  - test_cast_blit: gfx_draw_rgb565 LE-pair exactness, clip
+    row/column cuts, bleed containment, 0x0000 fidelity.
+  - test_usbcast (a): boots UsbCast.jar through the REAL
+    fpj2me_boot with two mock-fed frames then link-EOF: frames==2,
+    acks==2, painted>=2, wire == "RKKQ", and frame-2's payload is
+    pixel-exact on fp_screen.
+  - test_usbcast (b): ONE frame, no EOF, a RSOFT press delivered
+    while a native read is BLOCKED: close() aborts it, wire ==
+    "RKQ", boot returns 0 (the exit-key law, proven).
+  - boot_jar: FPJ_USB_FRAMES=2 boots UsbCast.jar inside the 36 KB
+    stack thread (drawPixels path is stack-flat) — "RKKQ" asserted.
+  - ZERO regressions: all Round-9 checks still pass (300 unit PASS
+    lines now, RESULT: ALL PASS).
+
+2026-11-25 (9) COMPLETE java.lang.Math + EXCEPTION STUBS — BOOTING
+WILD WEST GUNS (on top of (8); jar = Wild West Guns, GloftWWGU
+v1.0.9, CLDC-1.0/MIDP-2.0, 232105 bytes): on-device, launching
+wwg.jar halted at the boot diag overlay with "c: java/lang/inde..."
+(the class line parked on the exception family the game instantiates)
+and "m: java/lang/Math.max" — the (JJ)J overload of Math.max was
+never registered, fell into the graceful-miss no-op (ZEROED return)
+and the boot state machine spun on the garbage. Round 9 closes the
+whole family in one pass instead of waiting for the next freeze:
+  THE MATH SET (src/natives.c, 20 registered overloads): max/min for
+  (II)I (JJ)J (FF)F (DD)D and abs for (I)I (J)J (F)F (D)D — all the
+  max/min carry CLDC 1.1 NaN / ±0.0 semantics (NaN wins,
+  max(+0.0,-0.0)=+0.0, min(+0.0,-0.0)=-0.0 — checked BIT-EXACT by
+  the new tests), abs(INT_MIN)/abs(LONG_MIN) wrap per the JLS; plus
+  sin/cos/tan/sqrt/ceil/floor/toRadians/toDegrees (D)D. NO libm:
+  fpdoom links -nostdlib + -lgcc and the transcendentals are NOT in
+  libgcc, so the trig is ONE pure-C implementation shared with the
+  new arc rasterizer (midp_graphics.c gfx_sincos: quadrant reduction
+  + degree-11 Taylor kernels, < 1e-11 on |r| <= PI/4); sqrt keeps
+  the Newton iterate plus a 1-ULP NUDGE (AM-GM holds in real
+  arithmetic only — the iterate can round a hair UNDER the root and
+  (int)sqrt(16) then truncates to 3; the run30 probe pins this);
+  ceil follows the JLS negative-zero rule (ceil(-0.5) = -0.0).
+  THE EXCEPTION STUBS: <init>()V and <init>(Ljava/lang/String;)V
+  registered on the EXACT classes IndexOutOfBoundsException,
+  ArrayIndexOutOfBoundsException, StringIndexOutOfBounds-,
+  IllegalArgument-, IllegalState-, NullPointer-, Arithmetic-,
+  NumberFormat-, ClassCast- and RuntimeException, so a game's
+  'new IndexOutOfBoundsException("msg")' resolves immediately (and
+  Class.forName finds them via lib_known); getMessage()/toString()
+  keep resolving up the stub chain to the Throwable natives. The
+  super chains were already modeled (stub_super_of) so catch blocks
+  match.
+  PROACTIVE CONSTANT-POOL SCAN of the real wwg.jar (12 class files):
+  every java/*, javax/* and com/nokia/* class, method and field
+  reference diffed against the registry + stub chains — 17 gaps
+  beyond Math, all closed in the same round: Integer.byteValue()B
+  (sign-extended narrowing), new String(char[],off,len) — the
+  char[] sibling of Round 8's byte[] ctor, same handle_rebind flow
+  with StringIndexOutOfBoundsException bounds, Thread.activeCount
+  ()I (= 1, cooperative runtime), Hashtable.remove(Object) (returns
+  the old value, compacts the pair array, preserves order),
+  Canvas/MIDlet <init>()V (the game subclass super() chains —
+  registering them keeps the diag M: line clean of bogus misses),
+  Command(label,type,priority) + Displayable addCommand/
+  removeCommand/setCommandListener (the WWG softkey path: inert
+  but real, label/type/priority stored), Manager.createPlayer
+  (InputStream,String) (the WWG music path, same silent player),
+  and the four Graphics primitives clipRect/drawArc/fillArc/
+  drawRoundRect: clipRect INTERSECTS with the current clip
+  (JSR-118 — the exact opposite of setClip's replace semantics
+  that GLLib's glyph engine depends on), and the arcs are a REAL
+  parametric ellipse rasterizer (midp_graphics.c gfx_arc): MIDP
+  angle convention (0° = 3 o'clock, positive = counter-clockwise
+  on screen), boundary points stepping at <= 0.5 px of rim with
+  sin/cos advanced by the rotation recurrence (6 soft-double
+  multiplies per step, ~1e-12 drift over the <= 8000 steps a
+  screen-sized arc needs), drawArc chaining rim segments, fillArc
+  filling the PIE with center spokes (JSR-118 "pie slice"), a full
+  ±360° sweep degenerating into the complete disk/outline,
+  drawRoundRect = 4 edges + 4 quarter-ellipse corners (arcWidth/
+  arcHeight are the corner-oval DIAMETERS per JSR-118); negative
+  width/height raises IllegalArgumentException exactly like a
+  real MIDP. javax/microedition/lcdui/CommandListener joined
+  known_libs for Class.forName probes.
+  VERIFY: hostcheck 286/286 (+2 stack-boot boots): the C-level Math
+  matrix calls all 20 overloads through the registry with bit-exact
+  expectations (NaN payload, the sign of every zero, INT_MIN/LONG_MIN
+  wraps, sqrt(2) to 1e-9, sin odd, sin(-0.0) = -0.0, ceil/floor
+  fraction rules, toRadians/toDegrees round trips); run25..run32
+  exercise the bytecode marshaling end-to-end (run25: the (JJ)J
+  max/min pair the phone tripped on; run26: sqrt/max(DD)/max(FF)/
+  sin/cos/ceil through d2i/f2i/dcmpl -> 454; run27: new exception
+  ctors + getMessage through the chain -> 27; run28: the
+  interpreter's own array-bounds throw unwinding to a
+  catch(IndexOutOfBoundsException) handler — the FIRST test method
+  carrying a nonzero exception table; run29..run32: isolated
+  one-term probes so a future failure names its exact culprit);
+  the gfx tests rasterize a full-disk fillArc, quadrant pies, rims,
+  rounded corners and clipRect intersections into a 20x20 image
+  and check pixels; Hashtable put/remove round-trips; the char[]
+  String ctor rebinds and raises on bounds. Zero AC1/AC2
+  regressions: every native those jars use is unchanged, and the
+  Round 7 LCD pipeline / fp_platform.c / fpj_lcd.h are untouched
+  (locked).
+  ON-PHONE EXPECTATION: WWG's boot passes the Math.max call that
+  froze it (diag M: line stays empty), and its catch blocks get
+  real exception objects. Any later freeze shows a NEW m: line in
+  the diag overlay — that is the next missing native to model.
+2026-11-25 (8) CLDC 1.1 / JAVA 5 WRAPPER BOXING — THE AC2 SOUND-
+PROMPT FREEZE (on top of (7); jar = Assassin's Creed II, GloftASC2
+v1.1.8, CLDC-1.0/MIDP-2.0, 137038 bytes): on-device Round 7 confirmed
+the display and D-pad fixed and AC2 booting to its SOUND SET ->
+"DO YOU WANT SOUND? (YES/NO)" screen, but SELECT froze there — no
+crash, no red banner. The diag overlay told the whole story: the
+m: line read java/lang/Integer.valueOf. The settings menu boxes its
+selection index; the unmodeled factory fell into the graceful-miss
+path (logged no-op, ZEROED return), valueOf came back null, and the
+downstream dereference froze the state machine — the same silent-
+freeze shape as the getClass() NPE in (3).
+  THE FIX (src/natives.c + tests only — fp_platform.c, fpj_lcd.h and
+  the Round 7 refresh pipeline untouched):
+  - Full wrapper set with a shared payload layout: SLOT 0 = value
+    (Byte/Short stored sign-extended; *Value() truncates on the way
+    out), Long spreads (J) over SLOT 0+1. Every instance carries
+    >= 2 payload words (native_new floor) or >= 4 (the interpreter's
+    'new' opcode floor), so 'new X(v)' and 'X.valueOf(v)' write the
+    same payload and are interchangeable.
+  - Registered per CLDC 1.1 + the Java 5 autoboxing families the
+    jars actually use: valueOf(I/Z/J/B/S/C) AND valueOf(String) for
+    Integer/Long/Boolean (the diag m: line carries no signature, so
+    both overloads are covered), <init> constructors for all six
+    (2009 Gameloft jars are 1.4.2-compiled — explicit 'new Integer'
+    is at least as common as autoboxing), *Value() accessors,
+    instance toString() for every wrapper (Character gets real
+    UTF-8 -> UTF-16 for chars > 0x7F), value-based equals() /
+    hashCode() per J2SE semantics (Hashtable/Vector keyed on boxed
+    values work), and Long.parseLong + Long.toString(J) riding the
+    same formatter.
+  - A CONSTANT-POOL SCAN of the real GloftASC2 jar then pinned the
+    natives AC2 actually calls past the sound prompt, closing the
+    round instead of waiting for the next on-phone freeze:
+    Integer.valueOf(String,int) (the RADIX overload — very likely
+    THE call the diag saw), Integer.toString(int,int) (radix
+    formatter, INT_MIN-safe), Byte.parseByte(String),
+    StringBuffer.append(Z) and append(Object) (appends the
+    object's own toString: wrappers -> their value text), and the
+    String CONSTRUCTORS — new String(), new String(String) and
+    new String(byte[],off,len[,charset]). Those were the deep one:
+    'new String' from bytecode allocates a placeholder T_OBJECT
+    (the 'new' opcode cannot know the length), but every String in
+    this VM is a T_ARR_C char array. New heap.c primitive
+    handle_rebind(): the constructor builds the real array and the
+    CALLER's handle is moved onto it; the placeholder becomes
+    ordinary garbage whose ->handle aims at the array's old number
+    so the sweep recycles that number exactly once. The receiver is
+    pinned across the constructor's allocation (the invoke already
+    popped it into a C local the mark phase cannot see). AC2's
+    GLLib builds every text/IGP string through this path — before
+    it, 'new String(bytes..)' was a no-op leaving a hollow object
+    (empty text everywhere, the next guaranteed freeze).
+  - Boolean.valueOf returns pinned TRUE/FALSE SINGLETONS (J2SE
+    semantics; games do test Boolean identity with ==). A 256-entry
+    Integer -128..127 cache is deliberately NOT modeled: the GC pin
+    stack is only 64 deep (heap.c) and would silently drop pins —
+    value identity for the other wrappers is covered by equals().
+    natives_reset() drops the singleton pins with the other suite-
+    wide pins.
+  LATENT BUG FOUND AND FIXED by the new tests: nat_String_valueOf_I
+  ended with "buf[15] = 0" — position 15 is ALWAYS the last digit
+  the do/while wrote (for every value incl. 0), so String.valueOf(I)
+  / Integer.toString(I) silently DROPPED the final character:
+  String.valueOf(5) -> "", -200 -> "-20". Every int a game formats
+  through it (scores, timers, counters) was wrong. The (J) variant
+  never had the line; the (I) variant now matches it.
+  VERIFY: hostcheck 191/191 (19 new units; Tst run6..run24 hand-
+  assembled in tools/make_test_jar.py): per-wrapper round-trips
+  including NEGATIVES (Integer -1234 / 127 / 128 / 0 / new Integer
+  / valueOf("-99"), Boolean true + new Boolean(false), Long
+  -1234567890123L through the (J) two-slot marshaling, Byte -100,
+  Short -20000, Character 65 + non-ASCII 0x4E2D), toString() of all
+  six wrappers checked as UTF-16 char[] content, equals() true
+  cross-instance and false cross-type (Integer vs Short), and the
+  Boolean singleton identity via if_acmpne; then the AC2 call
+  sites: valueOf("2A",16) -> 42, toString(255,16) -> "ff",
+  parseByte("-100") -> -100, new String(bytes,off,len) exercised
+  twice on one byte[] (length + charAt + a second window) proving
+  the handle rebind end-to-end, and StringBuffer
+  append(Z)+append(Object) -> "truefalse7". The CONSTANT_Long
+  double-slot rule (JVMS 4.4.5) is now exercised end-to-end (the
+  emitter's slot counter AND pool count account for the phantom
+  slot — the first test jar to carry long CP constants).
+  ON-PHONE EXPECTATION: AC2's SOUND SET select advances (YES/NO
+  chosen, game proceeds past the prompt); the text/IGP loader now
+  gets real strings out of new String(bytes,...). Any later freeze
+  shows a NEW m: line in the diag overlay — that is the next
+  missing native to model.
 2026-11-25 (7) HANDLE THE SCREEN EXACTLY LIKE STOCK FPDOOM (real-
 hardware round, on top of (6)): the wrap SURVIVED (6) — adding
 fpj_spi_retire_frame() (the TX_END count-closed gate) did not remove
@@ -1212,9 +1847,20 @@ Testing without hardware
         sleep), with spin counters proving early exit, not timeout;
         a missing library native (String.equalsIgnoreCase) asserted
         to degrade to a zero no-op WITHOUT panicking
+    boxing (the (8) wrapper fix): Integer/Boolean/Long/Byte/Short/
+        Character valueOf() round-trips including NEGATIVES, the
+        valueOf(String) and valueOf(String,radix) overloads, 'new
+        X(v)' constructors, the (J) two-slot marshaling (ldc2_w
+        CONSTANT_Long double-slot rule included), toString() of all
+        six wrappers compared as UTF-16 char[] content (this suite
+        caught the String.valueOf(int) last-digit truncation),
+        Integer.toString(v,radix), Byte.parseByte, equals()
+        cross-instance/cross-type, the Boolean TRUE/FALSE singleton
+        identity, new String(byte[],off,len) handle rebind (the
+        GLLib text path), and StringBuffer append(Z)/append(Object)
     font: launcher glyph drawing + selection bar
     GC: garbage reclaimed, pinned survivors, handle invalidation
-  STATUS: 172/172 PASS (170 unit + 36KB-stack boots of the smoke
+  STATUS: 191/191 PASS (189 unit + 36KB-stack boots of the smoke
   jar and a 24-deep superchain jar).
     VISIBLE M1 CYCLE (the same classfiles the phone runs): startApp ->
       Display.setCurrent -> paint() through the interpreter (green box,
@@ -1245,3 +1891,5 @@ External references
   preverify   commercial jars ship preverified already; for your own
               test MIDlets use Oracle WTK 2.5.2 preverify
 
+License: your call — suggested MIT for fpj2me code; vendor files keep
+their own licenses (miniz MIT, stb MIT/PD, font8x8 PD).

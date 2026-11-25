@@ -25,27 +25,137 @@
 uint16_t fp_screen[FP_LCD_W * FP_LCD_H];
 int fp_rawmap[KP_MAX];
 static uint32_t now_ms;
+
+/* ---- USB mock state (Round 10 pipe + Round 12 drip counters) --------
+ * Declared up here because the fp_sleep_ms stub needs the RX-pending
+ * test for the Round 12 "never sleep while payload streams" pin. The
+ * mock FUNCTIONS stay in their Round 10 section below; docs too.    */
+#define MOCK_RX_CAP (192 * 1024)
+#define MOCK_TX_CAP 256
+static u8  usb_rx[MOCK_RX_CAP]; static u32 usb_rx_len, usb_rx_pos;
+static u8  usb_tx[MOCK_TX_CAP]; static u32 usb_tx_len;
+static int usb_eof;
+/* Round 12: drip mode simulates the 64-byte bulk wire cadence       */
+static unsigned usb_drip_chunk;    /* 0 = off: drain everything      */
+static u32 usb_drip_calls;
+static int usb_midframe_rearm;     /* arm RSOFT once, mid-frame      */
+static u32 usb_sleep_pending;      /* fp_sleep_ms while RX waits     */
+static u32 usb_bulk_reads;         /* fp_usb_read calls with len>=4K */
+
 uint32_t fp_time_ms(void) { return now_ms; }
-void fp_sleep_ms(uint32_t ms) { now_ms += ms; }
+void fp_sleep_ms(uint32_t ms) {
+    /* Round 12 stall pin: sleeping while USB payload is still queued
+     * is exactly the 0.2 fps bug (the fill loop must tight-spin)    */
+    if (usb_drip_chunk && usb_rx_len > usb_rx_pos) usb_sleep_pending++;
+    now_ms += ms;
+}
 /* mirrors fp_platform.c on target: the diag strip renders on flush */
 void fp_lcd_flush(void) { fpj_diag_overlay(); }
 void fp_dbg(const char *s) { fputs(s, stderr); fputc('\n', stderr); }
 uint32_t fp_keys_held(void) { return 0; }
 
 /* scripted key events for the input-semantics tests */
-static const struct { fp_key_t k; int down; } key_script[] = {
+typedef struct { fp_key_t k; int down; } KEnt;
+static const KEnt key_script[] = {
     { KP_LEFT, 1 }, { KP_LEFT, 0 },   /* tap: must latch in getKeyStates */
     { KP_5,    1 },                  /* digit 5 held: acts as FIRE      */
 };
+/* Round 10: the UsbCast exit-key probe swaps the script to a RSOFT
+ * press so keyPressed(-7) fires while a native USB read is BLOCKED —
+ * close() must abort it (the "exit key always breaks the wait" law).*/
+static const KEnt soft2_script[] = {
+    { KP_SOFT2, 1 }, { KP_SOFT2, 0 },
+};
+static const KEnt *ks = key_script;
+static int ks_n = (int)(sizeof key_script / sizeof key_script[0]);
 static int key_script_i;
+static void key_script_use(const KEnt *a, int n) { ks = a; ks_n = n; key_script_i = 0; }
+/* the interpreter's dispatch pump is PRE-PRIMED (first pump after one
+ * instruction), so a script armed before boot fires while the canvas
+ * is still null. The UsbCast exit-key probe re-arms the script at the
+ * FIRST BLOCKED read instead — exactly the scenario under test:
+ * "user presses RSOFT while the phone waits for USB".            */
+static int key_block_rearm;
+static void key_script_rearm(void) { key_script_i = 0; }
 int fp_key_event(fp_key_t *k, int *p) {
-    if (key_script_i >= (int)(sizeof key_script / sizeof key_script[0]))
-        return 0;
-    *k = key_script[key_script_i].k;
-    *p = key_script[key_script_i].down;
+    if (key_script_i >= ks_n) return 0;
+    *k = ks[key_script_i].k;
+    *p = ks[key_script_i].down;
     key_script_i++;
     return 1;
 }
+
+/* ---- Round 10: mock USB transport (the "comm:usb" pipe) -------------
+ * A simple FIFO standing in for fpdoom's usbio ring: the test feeds
+ * scripted frames (fp_usb_mock_feed), natives drain them, writes are
+ * captured (fp_usb_mock_tx) for ACK verification, and fp_usb_mock_eof
+ * flips the "link gone" flag that aborts blocked reads (the target
+ * never reports EOF; exit there is the close()/exit-key path).
+ * State lives in the header block above (Round 12 moved it there so
+ * the fp_sleep_ms stub can pin "no sleep while payload streams").  */
+void fp_usb_mock_feed(const void *p, unsigned n) {
+    if (n > MOCK_RX_CAP - usb_rx_len) n = MOCK_RX_CAP - usb_rx_len;
+    memcpy(usb_rx + usb_rx_len, p, n);
+    usb_rx_len += n;
+}
+void fp_usb_mock_eof(void)   { usb_eof = 1; }
+const u8 *fp_usb_mock_tx(unsigned *len) { *len = usb_tx_len; return usb_tx; }
+/* Round 11: fp_usb_init() mock. usb_cold_seqs counts how many times
+ * the cold sequence actually RAN (first call after reset); later
+ * calls adopt the live controller - exactly the target semantics of
+ * fp_platform.c's fpj_usb_up. usb_cold_fail forces -1 once to test
+ * the ConnectionNotFoundException path in nat_Connector_open.      */
+int usb_cold_up, usb_cold_seqs, usb_cold_fail;
+int fp_usb_init(void) {
+    if (usb_cold_fail) { usb_cold_fail = 0; return -1; }
+    if (!usb_cold_up) { usb_cold_up = 1; usb_cold_seqs++; }
+    return 0;
+}
+void fp_usb_mock_reset(void) {
+    usb_rx_len = usb_rx_pos = 0;
+    usb_tx_len = 0;
+    usb_eof = 0;
+    usb_cold_up = 0;         /* Round 11: device cold again          */
+    usb_drip_chunk = 0;      /* Round 12: drip + counters off        */
+    usb_drip_calls = 0;
+    usb_midframe_rearm = 0;
+    usb_sleep_pending = 0;
+    usb_bulk_reads = 0;
+    key_block_rearm = 0;
+}
+/* ---- Round 12: drip mode + tight-loop pins (see the header block) --- */
+int fp_usb_read(void *dst, unsigned len) {
+    u32 avail = usb_rx_len - usb_rx_pos;
+    if (!avail && !usb_eof && len && key_block_rearm) {
+        key_block_rearm = 0;          /* first blocked read: RSOFT now */
+        key_script_rearm();
+    }
+    if (usb_drip_chunk) {
+        /* one wire "packet" per call: cap the release, advance the
+         * virtual clock, optionally fire the mid-frame exit key     */
+        if (avail > usb_drip_chunk) avail = usb_drip_chunk;
+        now_ms++;
+        usb_drip_calls++;
+        if (usb_midframe_rearm && usb_drip_calls == 64) {
+            usb_midframe_rearm = 0;
+            key_script_rearm();       /* RSOFT lands mid-payload       */
+        }
+    }
+    if (len >= 4096) usb_bulk_reads++;
+    if (!avail) return usb_eof ? -1 : 0;
+    if (len > avail) len = avail;
+    memcpy(dst, usb_rx + usb_rx_pos, len);
+    usb_rx_pos += len;
+    return (int)len;
+}
+int fp_usb_write(const void *src, unsigned len) {
+    if (len > MOCK_TX_CAP - usb_tx_len) len = MOCK_TX_CAP - usb_tx_len;
+    if (len) memcpy(usb_tx + usb_tx_len, src, len);
+    usb_tx_len += len;
+    return (int)len;
+}
+unsigned fp_usb_available(void) { return usb_rx_len - usb_rx_pos; }
+void fp_usb_reset(void) { }   /* tests drive the mock via fp_usb_mock_reset */
 
 fp_file *fp_fopen(const char *p, const char *m) { return (fp_file *)fopen(p, m); }
 int fp_fread(void *b, int s, int n, fp_file *f) { return (int)fread(b, s, n, (FILE *)f); }
@@ -327,6 +437,21 @@ static void test_rms(void)
 }
 
 /* ---- VM: classfile parser + interpreter + native dispatch -------- */
+
+/* Java String (T_ARR_C, UTF-16) == ASCII C literal — used by the
+ * wrapper toString() checks (all expected values are ASCII)          */
+static int jstr_eq(JRef r, const char *expect)
+{
+    JObj *o = obj(r);
+    if (!o || o->type != T_ARR_C) return 0;
+    u32 n = ARR_LEN(o);
+    if (n != (u32)strlen(expect)) return 0;
+    u16 *ch = (u16 *)ARR_DATA(o);
+    for (u32 i = 0; i < n; i++)
+        if ((u32)ch[i] != (u8)expect[i]) return 0;
+    return 1;
+}
+
 static void test_vm(void)
 {
     Slot ret[2] = {{0}, {0}};
@@ -380,6 +505,139 @@ static void test_vm(void)
           "VM: <clinit> initialized static y == 41");
     CHECK(fpj_call_static("Tst", "run5", "()I", ret) && (s32)ret[0].w == 1,
           "VM: lcmp operand order (100L > 50L)");
+
+    /* ---- CLDC 1.1 / Java 5 wrapper boxing (Round 8) -----------------
+     * AC2 froze at its SOUND SET prompt: Integer.valueOf was unmodeled,
+     * degraded to a null return and the NPE froze the state machine.
+     * run6..run19 (emitted by tools/make_test_jar.py) round-trip every
+     * wrapper through valueOf()/new/<init>/(*Value)/toString()/equals —
+     * NEGATIVES included, plus the (J) two-slot marshaling and the
+     * Boolean TRUE/FALSE singleton identity.                       */
+    CHECK(fpj_call_static("Tst", "run6", "()I", ret) && (s32)ret[0].w == -1085,
+          "boxing: Integer.valueOf(I/-/String) + new Integer round-trip");
+    CHECK(fpj_call_static("Tst", "run7", "()I", ret) && (s32)ret[0].w == 2,
+          "boxing: Boolean.valueOf(true) + new Boolean(false)");
+    CHECK(fpj_call_static("Tst", "run8", "()I", ret) && (s32)ret[0].w == 1,
+          "boxing: Long.valueOf(-1234567890123L).longValue() (J slots)");
+    CHECK(fpj_call_static("Tst", "run9", "()I", ret) && (s32)ret[0].w == -10,
+          "boxing: Byte.valueOf(-100).byteValue() sign-extends");
+    CHECK(fpj_call_static("Tst", "run10", "()I", ret) && (s32)ret[0].w == -7655,
+          "boxing: Short.valueOf(-20000).shortValue() sign-extends");
+    CHECK(fpj_call_static("Tst", "run11", "()I", ret) && (s32)ret[0].w == 20078,
+          "boxing: Character.valueOf(65)+valueOf(0x4E2D) charValue()");
+    CHECK(fpj_call_static("Tst", "run18", "()I", ret) && (s32)ret[0].w == 2,
+          "boxing: equals value-based, cross-type Integer vs Short");
+    CHECK(fpj_call_static("Tst", "run19", "()I", ret) && (s32)ret[0].w == 1,
+          "boxing: Boolean.valueOf(true) singleton identity (pinned)");
+    {   /* toString() of every wrapper, checked as Java char[] strings  */
+        JRef sr;
+        CHECK(fpj_call_static("Tst", "run12", "()Ljava/lang/String;", ret)
+              && (sr = ret[0].ref) != 0 && jstr_eq(sr, "-456"),
+              "boxing: Integer.valueOf(-456).toString()");
+        CHECK(fpj_call_static("Tst", "run13", "()Ljava/lang/String;", ret)
+              && (sr = ret[0].ref) != 0 && jstr_eq(sr, "-9876543210"),
+              "boxing: Long.valueOf(-9876543210L).toString()");
+        CHECK(fpj_call_static("Tst", "run14", "()Ljava/lang/String;", ret)
+              && (sr = ret[0].ref) != 0 && jstr_eq(sr, "false"),
+              "boxing: Boolean.valueOf(false).toString()");
+        CHECK(fpj_call_static("Tst", "run15", "()Ljava/lang/String;", ret)
+              && (sr = ret[0].ref) != 0 && jstr_eq(sr, "A"),
+              "boxing: Character.valueOf(65).toString()");
+        CHECK(fpj_call_static("Tst", "run16", "()Ljava/lang/String;", ret)
+              && (sr = ret[0].ref) != 0 && jstr_eq(sr, "-3"),
+              "boxing: Byte.valueOf(-3).toString()");
+        CHECK(fpj_call_static("Tst", "run17", "()Ljava/lang/String;", ret)
+              && (sr = ret[0].ref) != 0 && jstr_eq(sr, "12345"),
+              "boxing: Short.valueOf(12345).toString()");
+    }
+
+    /* ---- AC2's real call sites (constant-pool scan of GloftASC2) ----
+     * The jar references Integer.valueOf(String,int), Integer.toString
+     * (int,int), Byte.parseByte, new String(byte[],int,int) and
+     * StringBuffer.append(boolean/Object) — each modeled this round. */
+    CHECK(fpj_call_static("Tst", "run20", "()I", ret) && (s32)ret[0].w == 42,
+          "boxing: Integer.valueOf(\"2A\", 16).intValue() (AC2 overload)");
+    CHECK(fpj_call_static("Tst", "run21", "()Ljava/lang/String;", ret)
+          && ret[0].ref != 0 && jstr_eq(ret[0].ref, "ff"),
+          "boxing: Integer.toString(255, 16) radix formatter");
+    CHECK(fpj_call_static("Tst", "run22", "()I", ret) && (s32)ret[0].w == -100,
+          "boxing: Byte.parseByte(\"-100\") narrows with sign");
+    CHECK(fpj_call_static("Tst", "run23", "()I", ret) && (s32)ret[0].w == 109,
+          "String: new String(bytes,off,len) ctor rebinds handle (GLLib text)");
+    CHECK(fpj_call_static("Tst", "run24", "()I", ret) && (s32)ret[0].w == 10,
+          "StringBuffer: append(Z)+append(Object) -> \"truefalse7\"");
+
+    /* ---- Round 9 (WWG): complete Math + exception stubs -------------
+     * The on-device boot diag showed "m: java/lang/Math.max" (the
+     * (JJ)J overload falling into the no-op fallback) and "c:
+     * java/lang/inde..." (the exception the game then threw/caught).
+     * run25..run28 exercise the closures through real bytecode.      */
+    CHECK(fpj_call_static("Tst", "run25", "()I", ret) && (s32)ret[0].w == 1,
+          "Math: max/min (II)I + the (JJ)J overloads (WWG freeze)");
+    CHECK(fpj_call_static("Tst", "run26", "()I", ret) && (s32)ret[0].w == 454,
+          "Math: sqrt/max(D)/max(F)/sin/cos/ceil via d2i/f2i/dcmpl");
+    CHECK(fpj_call_static("Tst", "run27", "()I", ret) && (s32)ret[0].w == 27,
+          "exceptions: new X(msg)/new X() + getMessage through the chain");
+    CHECK(fpj_call_static("Tst", "run28", "()I", ret) && (s32)ret[0].w == 7,
+          "exceptions: VM athrow -> catch(IndexOutOfBounds) handler");
+    /* isolated one-term probes (same jar): each pins a single piece
+     * so a future regression names the exact culprit               */
+    CHECK(fpj_call_static("Tst", "run29", "()I", ret) && (s32)ret[0].w == 2,
+          "exceptions: no-arg <init>() clears the message (isolated)");
+    CHECK(fpj_call_static("Tst", "run30", "()I", ret) && (s32)ret[0].w == 4,
+          "Math: sqrt(16.0) d2i exact (isolated, ulp nudge)");
+    CHECK(fpj_call_static("Tst", "run31", "()I", ret) && (s32)ret[0].w == 6,
+          "Math: sin(0)==0 through dcmpl (isolated)");
+    CHECK(fpj_call_static("Tst", "run32", "()I", ret) && (s32)ret[0].w == 2,
+          "Math: max(FF)F through f2i (isolated)");
+    /* ---- Round 10 (UsbCast): the comm:usb GCF roundtrip -------------
+     * Feed the mock pipe "FPJ2hello" + 'Z'; run33 opens a BAD url
+     * first (ConnectionNotFoundException, caught), then comm:usb,
+     * reads 10 bytes, writes the 'K' ACK and returns 10 + 100.     */
+    fp_usb_mock_reset();
+    fp_usb_mock_feed("FPJ2hello", 10);
+    { u8 z = 'Z'; fp_usb_mock_feed(&z, 1); }
+    CHECK(fpj_call_static("Tst", "run33", "()I", ret) && (s32)ret[0].w == 110,
+          "gcf: Connector.open(comm:usb) streams + bad URL -> CNFE");
+    {
+        unsigned tlen; const u8 *tx = fp_usb_mock_tx(&tlen);
+        CHECK(tlen == 1 && tx[0] == 'K',
+              "gcf: OutputStream.write('K') ACK reached the wire");
+    }
+
+    /* ---- Round 11 (cold USB): the open must ARM the controller -----
+     * run33 above opened comm:usb exactly once: the cold sequence
+     * must have run exactly once for it (boot arming + open adoption
+     * are the phone's fp_usb_init() contract: never re-run under a
+     * live link). Then a SECOND run33 (same controller session) must
+     * still stream 110 while the sequence count stays 1.            */
+    CHECK(usb_cold_seqs == 1,
+          "usbcold: first comm:usb open runs the cold-init once");
+    fp_usb_mock_feed("FPJ2hello", 10);
+    { u8 z = 'Z'; fp_usb_mock_feed(&z, 1); }
+    CHECK(fpj_call_static("Tst", "run33", "()I", ret) && (s32)ret[0].w == 110,
+          "usbcold: second open streams (pipe stays live)");
+    CHECK(usb_cold_seqs == 1,
+          "usbcold: second open ADOPTS the controller (no re-init)");
+    /* failure path: forced -1 -> the MIDP-mandated exception, and a
+     * clean recovery on the next open (mock consumed the failure)  */
+    usb_cold_fail = 1;
+    CHECK(fpj_call_static("Tst", "run33", "()I", ret) == 0,
+          "usbcold: failed cold-init -> open throws (MIDP semantics)");
+    {
+        JObj *eo = obj(fpj_pending_exc);
+        CHECK(fpj_pending_exc != 0 && eo && eo->clazz
+              && !strcmp(((JClass *)eo->clazz)->name,
+                         "javax/microedition/io/"
+                         "ConnectionNotFoundException"),
+              "usbcold: the throw IS ConnectionNotFoundException");
+        fpj_pending_exc = 0;  /* hostcheck consumed it              */
+    }
+    fp_usb_mock_feed("FPJ2hello", 10);
+    { u8 z = 'Z'; fp_usb_mock_feed(&z, 1); }
+    CHECK(fpj_call_static("Tst", "run33", "()I", ret) && (s32)ret[0].w == 110,
+          "usbcold: next open recovers after the failure");
+
 
     /* M1 visible smoke test — the same classfiles the phone runs.
      * startApp() did Display.getDisplay(this).setCurrent(new DemoScr())
@@ -1139,10 +1397,697 @@ static void test_cp_cache(void)
           "cache: getstatic/putstatic via cached JField");
 }
 
+/* --------------------------------------------------------------------
+ * Round 9 (WWG) — the complete CLDC 1.1 java.lang.Math matrix, called
+ * through the native registry with BIT-EXACT expectations: NaN
+ * payloads, the sign of every zero, INT_MIN/LONG_MIN wraps. These are
+ * the edges the bytecode probes (run25/run26) cannot express without
+ * Float.floatToIntBits.
+ * ------------------------------------------------------------------ */
+static u32 fw(float f)  { u32 w; memcpy(&w, &f, 4); return w; }
+static u64 dw64(double d){ u64 u; memcpy(&u, &d, 8); return u; }
+static float wf32(u32 w) { float f; memcpy(&f, &w, 4); return f; }
+static double wd64(u64 u){ double d; memcpy(&d, &u, 8); return d; }
+static int dnear(double a, double b, double tol)
+{ double d = a - b; if (d < 0) d = -d; return d <= tol; }
+#define DNAN   wd64(0x7FF8000000000000ULL)   /* canonical quiet NaN */
+#define DINF   wd64(0x7FF0000000000000ULL)
+#define ISNAN(d) ((d) != (d))
+
+static double math_dd(const char *nm, double x, double y)
+{
+    const NativeEntry *e = native_lookup("java/lang/Math", nm, "(DD)D");
+    Slot a[4], r[2] = {{0}, {0}};
+    u64 ux, uy; memcpy(&ux, &x, 8); memcpy(&uy, &y, 8);
+    a[0].w = (u32)ux; a[1].w = (u32)(ux >> 32);
+    a[2].w = (u32)uy; a[3].w = (u32)(uy >> 32);
+    e->fn(a, 4, r);
+    u64 u = (u64)r[0].w | (u64)r[1].w << 32;
+    double d; memcpy(&d, &u, 8); return d;
+}
+static double math_d1(const char *nm, double x)
+{
+    const NativeEntry *e = native_lookup("java/lang/Math", nm, "(D)D");
+    Slot a[2], r[2] = {{0}, {0}};
+    u64 ux; memcpy(&ux, &x, 8);
+    a[0].w = (u32)ux; a[1].w = (u32)(ux >> 32);
+    e->fn(a, 2, r);
+    u64 u = (u64)r[0].w | (u64)r[1].w << 32;
+    double d; memcpy(&d, &u, 8); return d;
+}
+static float math_ff(const char *nm, float x, float y)
+{
+    const NativeEntry *e = native_lookup("java/lang/Math", nm, "(FF)F");
+    Slot a[2], r[2] = {{0}, {0}};
+    a[0].w = fw(x); a[1].w = fw(y);
+    e->fn(a, 2, r);
+    float f; memcpy(&f, &r[0].w, 4); return f;
+}
+static s64 math_jj(const char *nm, s64 x, s64 y)
+{
+    const NativeEntry *e = native_lookup("java/lang/Math", nm, "(JJ)J");
+    Slot a[4], r[2] = {{0}, {0}};
+    a[0].w = (u32)(u64)x; a[1].w = (u32)((u64)x >> 32);
+    a[2].w = (u32)(u64)y; a[3].w = (u32)((u64)y >> 32);
+    e->fn(a, 4, r);
+    return (s64)((u64)r[0].w | (u64)r[1].w << 32);
+}
+static s64 math_j1(const char *nm, s64 x)
+{
+    const NativeEntry *e = native_lookup("java/lang/Math", nm, "(J)J");
+    Slot a[2], r[2] = {{0}, {0}};
+    a[0].w = (u32)(u64)x; a[1].w = (u32)((u64)x >> 32);
+    e->fn(a, 2, r);
+    return (s64)((u64)r[0].w | (u64)r[1].w << 32);
+}
+static s32 math_ii(const char *nm, s32 x, s32 y)
+{
+    const NativeEntry *e = native_lookup("java/lang/Math", nm, "(II)I");
+    Slot a[2], r[2] = {{0}, {0}};
+    a[0].w = (u32)x; a[1].w = (u32)y;
+    e->fn(a, 2, r);
+    return (s32)r[0].w;
+}
+static s32 math_i1(const char *nm, s32 x)
+{
+    const NativeEntry *e = native_lookup("java/lang/Math", nm, "(I)I");
+    Slot a[1], r[2] = {{0}, {0}};
+    a[0].w = (u32)x;
+    e->fn(a, 1, r);
+    return (s32)r[0].w;
+}
+static float math_f1(const char *nm, float x)
+{
+    const NativeEntry *e = native_lookup("java/lang/Math", nm, "(F)F");
+    Slot a[1], r[2] = {{0}, {0}};
+    a[0].w = fw(x);
+    e->fn(a, 1, r);
+    float f; memcpy(&f, &r[0].w, 4); return f;
+}
+#define ISNAN(d) ((d) != (d))
+
+static void test_math(void)
+{
+    /* ---- registry completeness: all 20 CLDC 1.1 entries ------------- */
+    static const struct { const char *nm, *sig; } need[] = {
+        { "max", "(II)I" }, { "min", "(II)I" },
+        { "max", "(JJ)J" }, { "min", "(JJ)J" },
+        { "max", "(FF)F" }, { "min", "(FF)F" },
+        { "max", "(DD)D" }, { "min", "(DD)D" },
+        { "abs", "(I)I" }, { "abs", "(J)J" },
+        { "abs", "(F)F" }, { "abs", "(D)D" },
+        { "sin", "(D)D" }, { "cos", "(D)D" }, { "tan", "(D)D" },
+        { "sqrt", "(D)D" }, { "ceil", "(D)D" }, { "floor", "(D)D" },
+        { "toRadians", "(D)D" }, { "toDegrees", "(D)D" },
+    };
+    int all = 1;
+    for (u32 i = 0; i < sizeof need / sizeof need[0]; i++)
+        if (!native_lookup("java/lang/Math", need[i].nm, need[i].sig))
+            all = 0;
+    CHECK(all, "Math: all 20 CLDC 1.1 overloads registered");
+
+    /* ---- int: negatives + extremes ---------------------------------- */
+    CHECK(math_ii("max", -5, 3) == 3 && math_ii("min", -5, 3) == -5,
+          "Math: max/min(II)I negatives");
+    CHECK(math_ii("max", (s32)0x80000000, 1) == 1
+          && math_ii("min", 0x7FFFFFFF, -1) == -1,
+          "Math: max/min(II)I at INT_MIN/INT_MAX");
+
+    /* ---- long: two-slot marshaling + extremes ----------------------- */
+    CHECK(math_jj("max", -5, 3) == 3 && math_jj("min", -5, 3) == -5,
+          "Math: max/min(JJ)J negatives (lo/hi slots)");
+    CHECK(math_jj("max", (s64)0x8000000000000000LL, 5) == 5
+          && math_jj("min", 0x7FFFFFFFFFFFFFFFLL, -5) == -5,
+          "Math: max/min(JJ)J at LONG_MIN/LONG_MAX");
+
+    /* ---- float: ±0.0 sign bits + NaN wins --------------------------- */
+    CHECK(fw(math_ff("max", -0.0f, 0.0f)) == 0x00000000u
+          && fw(math_ff("max", 0.0f, -0.0f)) == 0x00000000u,
+          "Math: max(FF)F +0.0 beats -0.0 (JLS)");
+    CHECK(fw(math_ff("min", 0.0f, -0.0f)) == 0x80000000u
+          && fw(math_ff("min", -0.0f, 0.0f)) == 0x80000000u,
+          "Math: min(FF)F -0.0 beats +0.0 (JLS)");
+    CHECK(fw(math_ff("max", wf32(0x7FC00000u), 1.0f)) == 0x7FC00000u
+          && fw(math_ff("min", 1.0f, wf32(0x7FC00000u))) == 0x7FC00000u,
+          "Math: max/min(FF)F NaN wins (JLS)");
+    CHECK(math_ff("max", -1.5f, 2.5f) == 2.5f
+          && math_ff("min", -1.5f, 2.5f) == -1.5f,
+          "Math: max/min(FF)F basic values");
+
+    /* ---- double: ±0.0 sign bits + NaN wins -------------------------- */
+    CHECK(dw64(math_dd("max", -0.0, 0.0)) == 0ULL
+          && dw64(math_dd("max", 0.0, -0.0)) == 0ULL,
+          "Math: max(DD)D +0.0 beats -0.0 (JLS)");
+    CHECK(dw64(math_dd("min", 0.0, -0.0)) == 0x8000000000000000ULL
+          && dw64(math_dd("min", -0.0, 0.0)) == 0x8000000000000000ULL,
+          "Math: min(DD)D -0.0 beats +0.0 (JLS)");
+    CHECK(dw64(math_dd("max", DNAN, 1.0)) == 0x7FF8000000000000ULL
+          && dw64(math_dd("min", 1.0, DNAN)) == 0x7FF8000000000000ULL,
+          "Math: max/min(DD)D NaN wins (JLS)");
+    CHECK(math_dd("max", -1.5, 2.5) == 2.5, "Math: max(DD)D basic value");
+
+    /* ---- abs: sign bit cleared, INT_MIN/LONG_MIN wrap (JLS) --------- */
+    CHECK(math_i1("abs", -7) == 7 && math_i1("abs", (s32)0x80000000) == (s32)0x80000000,
+          "Math: abs(I)I incl. INT_MIN wrap");
+    CHECK(math_j1("abs", -9) == 9
+          && math_j1("abs", (s64)0x8000000000000000LL) == (s64)0x8000000000000000LL,
+          "Math: abs(J)J incl. LONG_MIN wrap");
+    CHECK(fw(math_f1("abs", -0.0f)) == 0x00000000u,
+          "Math: abs(F)F |-0.0| = +0.0");
+    CHECK(fw(math_f1("abs", wf32(0xFFC00000u))) == 0x7FC00000u,
+          "Math: abs(F)F |-NaN| = +NaN (sign cleared)");
+    CHECK(fw(math_f1("abs", -3.0f)) == 0x40400000u,
+          "Math: abs(F)F -3.0f -> 3.0f");
+    CHECK(math_d1("abs", -0.0) == 0.0 && math_d1("abs", -3.0) == 3.0,
+          "Math: abs(D)D -0.0 -> +0.0, -3.0 -> 3.0");
+
+    /* ---- sqrt -------------------------------------------------------- */
+    CHECK(math_d1("sqrt", 4.0) == 2.0, "Math: sqrt(4)=2 exact");
+    CHECK(dnear(math_d1("sqrt", 2.0), 1.4142135623730951, 1e-9),
+          "Math: sqrt(2) to 1e-9");
+    CHECK(ISNAN(math_d1("sqrt", -1.0)), "Math: sqrt(-1) = NaN (Java)");
+    CHECK(dw64(math_d1("sqrt", -0.0)) == 0x8000000000000000ULL,
+          "Math: sqrt(-0.0) = -0.0 (JLS)");
+    CHECK(dw64(math_d1("sqrt", 0.0)) == 0ULL, "Math: sqrt(+0.0) = +0.0");
+    CHECK(dw64(math_d1("sqrt", DINF)) == 0x7FF0000000000000ULL,
+          "Math: sqrt(Inf) = Inf");
+    CHECK(ISNAN(math_d1("sqrt", DNAN)), "Math: sqrt(NaN) = NaN");
+
+    /* ---- sin / cos / tan (pure-C kernels) --------------------------- */
+    CHECK(math_d1("sin", 0.0) == 0.0, "Math: sin(0)=0");
+    CHECK(dw64(math_d1("sin", -0.0)) == 0x8000000000000000ULL,
+          "Math: sin(-0.0) = -0.0 (sign preserved)");
+    CHECK(dnear(math_d1("sin", 0.5235987755982988), 0.5, 1e-9),
+          "Math: sin(pi/6) = 0.5");
+    CHECK(dnear(math_d1("sin", 1.5707963267948966), 1.0, 1e-9),
+          "Math: sin(pi/2) = 1");
+    CHECK(dnear(math_d1("sin", -0.3) + math_d1("sin", 0.3), 0.0, 1e-12),
+          "Math: sin is odd (sin(-x) = -sin(x))");
+    CHECK(math_d1("cos", 0.0) == 1.0, "Math: cos(0)=1 exact");
+    CHECK(dnear(math_d1("cos", 3.141592653589793), -1.0, 1e-9),
+          "Math: cos(pi) = -1");
+    CHECK(dnear(math_d1("cos", 1.0471975511965976), 0.5, 1e-9),
+          "Math: cos(pi/3) = 0.5");
+    CHECK(math_d1("tan", 0.0) == 0.0, "Math: tan(0)=0");
+    CHECK(dnear(math_d1("tan", 0.7853981633974483), 1.0, 1e-9),
+          "Math: tan(pi/4) = 1");
+    CHECK(ISNAN(math_d1("sin", DINF))
+          && ISNAN(math_d1("cos", DINF))
+          && ISNAN(math_d1("tan", DINF)),
+          "Math: sin/cos/tan(Inf) = NaN (Java)");
+    CHECK(ISNAN(math_d1("sin", DNAN)),
+          "Math: sin(NaN) = NaN");
+
+    /* ---- ceil / floor ------------------------------------------------ */
+    CHECK(math_d1("ceil", 2.1) == 3.0 && math_d1("ceil", -2.1) == -2.0,
+          "Math: ceil(2.1)=3, ceil(-2.1)=-2");
+    CHECK(math_d1("ceil", 2.0) == 2.0 && math_d1("ceil", -2.0) == -2.0,
+          "Math: ceil of integral is identity");
+    CHECK(dw64(math_d1("ceil", -0.5)) == 0x8000000000000000ULL,
+          "Math: ceil(-0.5) = -0.0 (JLS negative-zero rule)");
+    CHECK(math_d1("floor", 2.1) == 2.0 && math_d1("floor", -2.1) == -3.0,
+          "Math: floor(2.1)=2, floor(-2.1)=-3");
+    CHECK(math_d1("floor", -0.5) == -1.0, "Math: floor(-0.5) = -1");
+    CHECK(ISNAN(math_d1("ceil", DNAN))
+          && ISNAN(math_d1("floor", DNAN)),
+          "Math: ceil/floor(NaN) = NaN");
+    CHECK(dw64(math_d1("ceil", DINF)) == 0x7FF0000000000000ULL,
+          "Math: ceil(+Inf) = +Inf");
+
+    /* ---- toRadians / toDegrees ---------------------------------------- */
+    CHECK(dnear(math_d1("toRadians", 180.0), 3.141592653589793, 1e-12),
+          "Math: toRadians(180) = pi");
+    CHECK(dnear(math_d1("toDegrees", 3.141592653589793), 180.0, 1e-10),
+          "Math: toDegrees(pi) = 180");
+    CHECK(dnear(math_d1("toRadians", 90.0), 1.5707963267948966, 1e-12),
+          "Math: toRadians(90) = pi/2");
+}
+
+/* --------------------------------------------------------------------
+ * Round 9 (WWG) — the 10 standard exception stub classes: <init> must
+ * be registered on the EXACT class (the game's 'new X(msg)' resolves
+ * it before the chain walk), the message must land in payload slot 1
+ * (getMessage reads it), and the no-arg ctor must clear it.
+ * ------------------------------------------------------------------ */
+static void test_exc_ctor(void)
+{
+    static const char *const excs[] = {
+        "java/lang/IndexOutOfBoundsException",
+        "java/lang/ArrayIndexOutOfBoundsException",
+        "java/lang/StringIndexOutOfBoundsException",
+        "java/lang/IllegalArgumentException",
+        "java/lang/IllegalStateException",
+        "java/lang/NullPointerException",
+        "java/lang/ArithmeticException",
+        "java/lang/NumberFormatException",
+        "java/lang/ClassCastException",
+        "java/lang/RuntimeException",
+    };
+    JRef msg = intern_str("m1");
+    CHECK(msg != 0, "exc: interned ctor message");
+    int ok_all = 1;
+    for (u32 i = 0; i < sizeof excs / sizeof excs[0]; i++) {
+        const NativeEntry *ni =
+            native_lookup(excs[i], "<init>", "(Ljava/lang/String;)V");
+        const NativeEntry *n0 =
+            native_lookup(excs[i], "<init>", "()V");
+        int ok = ni && n0;
+        if (ok) {
+            JRef e = ref_alloc(T_OBJECT, 16, class_load(excs[i]));
+            Slot a[2], r[2] = {{0}, {0}};
+            a[0].ref = e; a[1].ref = msg;
+            ni->fn(a, 2, r);                       /* <init>(String)   */
+            JObj *eo = obj(e);
+            ok = eo && eo->type == T_OBJECT
+                 && eo->clazz && OBJ_PAYLOAD(eo)[1] == (u32)msg;
+            if (ok) {                              /* getMessage       */
+                const NativeEntry *gm = native_lookup("java/lang/Throwable",
+                                                      "getMessage",
+                                                      "()Ljava/lang/String;");
+                Slot ga[1], gr[2] = {{0}, {0}};
+                ga[0].ref = e;
+                gm->fn(ga, 1, gr);
+                ok = gr[0].ref == msg;
+            }
+            if (ok) {
+                n0->fn(a, 1, r);                   /* <init>() clears  */
+                ok = OBJ_PAYLOAD(eo)[1] == 0;
+            }
+        }
+        if (!ok) ok_all = 0;
+    }
+    CHECK(ok_all, "exc: all 10 stub classes <init>(String)/(init) + payload");
+
+    /* the classes are known to Class.forName too (lib_known walks the
+     * registry) — a game probe must NOT get ClassNotFoundException    */
+    {
+        JRef e = fpj_new_exception(
+            "java/lang/StringIndexOutOfBoundsException", "why");
+        CHECK(e != 0 && obj(e) != 0,
+              "exc: fpj_new_exception builds a StringIndexOutOfBounds");
+        fpj_pending_exc = 0;             /* not a throw: just a build   */
+    }
+}
+
+/* --------------------------------------------------------------------
+ * Round 9 (WWG) — drawArc / fillArc / drawRoundRect / clipRect.
+ * ------------------------------------------------------------------ */
+static void test_arcs(void)
+{
+    /* full-disk fillArc: ellipse w=16 h=16, center (10,10), r=8       */
+    JImage *dst = image_create(20, 20);
+    MGraphics g; gfx_reset(&g, dst);
+    gfx_color_rgb(&g, 255, 0, 0);
+    gfx_arc(&g, 2, 2, 16, 16, 0, 360, 1);
+    int lit = 0;
+    for (int i = 0; i < 400; i++) if (dst->px[i] == 0xF800) lit++;
+    CHECK(lit > 150 && lit < 260, "gfx: fillArc 360 deg = full pie disk");
+
+    /* quarter wedge: 0..90 deg stays in x >= cx, y <= cy             */
+    memset(dst->px, 0, 400 * 2);
+    gfx_reset(&g, dst);
+    gfx_color_rgb(&g, 0, 0, 255);
+    gfx_arc(&g, 2, 2, 16, 16, 0, 90, 1);
+    CHECK(dst->px[8 * 20 + 15] == 0x001F      /* inside the quadrant  */
+          && dst->px[12 * 20 + 5] == 0,       /* opposite quadrant    */
+          "gfx: fillArc pie wedge covers only its quadrant");
+    CHECK(dst->px[10 * 20 + 10] == 0x001F,    /* center is in every wedge */
+          "gfx: fillArc spokes reach the center");
+
+    /* drawArc: rim only — the 0-degree point (18,10) lit, center not */
+    memset(dst->px, 0, 400 * 2);
+    gfx_reset(&g, dst);
+    gfx_color_rgb(&g, 0, 255, 0);
+    gfx_arc(&g, 2, 2, 16, 16, 0, 360, 0);
+    CHECK(dst->px[10 * 20 + 18] == 0x07E0      /* 0 deg = (18,10)     */
+          && dst->px[10 * 20 + 10] == 0,       /* interior untouched  */
+          "gfx: drawArc 360 draws the rim, not the interior");
+    CHECK(dst->px[10 * 20 + 2] == 0x07E0,      /* 180 deg = (2,10)    */
+          "gfx: drawArc covers the 180-degree point");
+
+    /* MIDP angle convention: 90 deg = 12 o'clock = (10, 2) on screen */
+    memset(dst->px, 0, 400 * 2);
+    gfx_reset(&g, dst);
+    gfx_arc(&g, 2, 2, 16, 16, 90, 0, 0);       /* degenerate: nothing */
+    CHECK(dst->px[10 * 20 + 2] == 0,
+          "gfx: zero arcAngle draws nothing (Java)");
+    memset(dst->px, 0, 400 * 2);
+    gfx_arc(&g, 2, 2, 16, 16, 90, 20, 0);      /* small arc at top    */
+    CHECK(dst->px[2 * 20 + 10] != 0            /* 90 deg = (10,2)     */
+          && dst->px[18 * 20 + 10] == 0,       /* bottom rim clean    */
+          "gfx: 90 deg + small sweep stays at the 12 o'clock rim");
+
+    /* clipRect: INTERSECT semantics (setClip REPLACES — see the
+     * setclip tests) + negative w/h empties                          */
+    gfx_reset(&g, dst);
+    gfx_clip_rect(&g, 5, 5, 10, 10);
+    CHECK(g.cx == 5 && g.cy == 5 && g.cw == 10 && g.ch == 10,
+          "gfx: clipRect first call clips to the rect");
+    gfx_clip_rect(&g, 8, 8, 10, 10);
+    CHECK(g.cx == 8 && g.cy == 8 && g.cw == 7 && g.ch == 7,
+          "gfx: clipRect intersects with the previous clip");
+    gfx_clip_rect(&g, 25, 25, 5, 5);            /* disjoint -> empty  */
+    CHECK(g.cw == 0 && g.ch == 0, "gfx: clipRect disjoint empties clip");
+    gfx_reset(&g, dst);
+    memset(dst->px, 0, 400 * 2);          /* isolate from the arc pixels */
+    gfx_clip_rect(&g, 0, 0, 10, 10);
+    gfx_color_rgb(&g, 255, 255, 255);
+    gfx_fill_rect(&g, 0, 0, 20, 20);
+    int corner = 0;
+    for (int i = 0; i < 400; i++) if (dst->px[i] == 0xFFFF) corner++;
+    CHECK(corner == 100, "gfx: fill respects the clipRect window");
+
+    /* drawRoundRect: corner arcs bulge inward — (0,0) NOT on the rim */
+    memset(dst->px, 0, 400 * 2);
+    gfx_reset(&g, dst);
+    gfx_color_rgb(&g, 255, 0, 0);
+    gfx_draw_roundrect(&g, 0, 0, 20, 20, 8, 8);
+    CHECK(dst->px[0 * 20 + 10] == 0xF800        /* top edge          */
+          && dst->px[10 * 20 + 0] == 0xF800     /* left edge         */
+          && dst->px[0 * 20 + 0] == 0,          /* corner cut        */
+          "gfx: drawRoundRect edges drawn, corners rounded off");
+    CHECK(dst->px[1 * 20 + 1] == 0xF800       /* 135 deg on the arc  */
+          && dst->px[2 * 20 + 1] == 0xF800,   /* the arc's diagonal   */
+          "gfx: drawRoundRect corner arc rasterizes");
+
+    /* registry: the four new Graphics natives                        */
+    CHECK(native_lookup("javax/microedition/lcdui/Graphics", "drawArc",
+                        "(IIIIII)V") != 0
+          && native_lookup("javax/microedition/lcdui/Graphics", "fillArc",
+                           "(IIIIII)V") != 0
+          && native_lookup("javax/microedition/lcdui/Graphics", "drawRoundRect",
+                           "(IIIIII)V") != 0
+          && native_lookup("javax/microedition/lcdui/Graphics", "clipRect",
+                           "(IIII)V") != 0,
+          "gfx: drawArc/fillArc/drawRoundRect/clipRect natives registered");
+    image_free(dst);
+}
+
+/* --------------------------------------------------------------------
+ * Round 9 (WWG) — the remaining constant-pool closures: Hashtable
+ * .remove, Integer.byteValue, Thread.activeCount, the Command /
+ * Displayable softkey path, and new String(char[],off,len).
+ * ------------------------------------------------------------------ */
+static void test_wwg_natives(void)
+{
+    Slot a[4], r[2] = {{0}, {0}};
+
+    /* Hashtable: put k1/k2/k3, remove the middle, order preserved    */
+    JRef h = ref_alloc(T_OBJECT, 16, class_load("java/util/Hashtable"));
+    const NativeEntry *e = native_lookup("java/util/Hashtable",
+                                         "<init>", "()V");
+    CHECK(e != 0, "Hashtable: <init> registered");
+    if (e) {
+        a[0].ref = h;
+        e->fn(a, 1, r);
+        JRef k1 = intern_str("k1"), v1 = intern_str("v1");
+        JRef k2 = intern_str("k2"), v2 = intern_str("v2");
+        JRef k3 = intern_str("k3"), v3 = intern_str("v3");
+        const NativeEntry *put = native_lookup("java/util/Hashtable", "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
+        a[0].ref = h; a[1].ref = k1; a[2].ref = v1;
+        put->fn(a, 3, r);
+        a[0].ref = h; a[1].ref = k2; a[2].ref = v2;
+        put->fn(a, 3, r);
+        a[0].ref = h; a[1].ref = k3; a[2].ref = v3;
+        put->fn(a, 3, r);
+        const NativeEntry *rem = native_lookup("java/util/Hashtable",
+            "remove", "(Ljava/lang/Object;)Ljava/lang/Object;");
+        CHECK(rem != 0, "Hashtable: remove(Object) registered (WWG)");
+        if (rem) {
+            a[0].ref = h; a[1].ref = k2;
+            rem->fn(a, 2, r);
+            CHECK(r[0].ref == v2, "Hashtable: remove returns old value");
+            const NativeEntry *get = native_lookup("java/util/Hashtable",
+                "get", "(Ljava/lang/Object;)Ljava/lang/Object;");
+            a[0].ref = h; a[1].ref = k2;
+            get->fn(a, 2, r);
+            CHECK(r[0].ref == 0, "Hashtable: removed key gone");
+            a[1].ref = k3;
+            get->fn(a, 2, r);
+            CHECK(r[0].ref == v3, "Hashtable: tail entry survives remove");
+            a[1].ref = k1;
+            get->fn(a, 2, r);
+            CHECK(r[0].ref == v1, "Hashtable: head entry survives remove");
+            a[0].ref = h; a[1].ref = intern_str("nope");
+            rem->fn(a, 2, r);
+            CHECK(r[0].ref == 0, "Hashtable: remove(miss) returns null");
+        }
+    }
+
+    /* Integer.byteValue: (byte) narrowing with sign extension        */
+    {
+        JRef box = ref_alloc(T_OBJECT, 8, class_load("java/lang/Integer"));
+        JObj *bo = obj(box);
+        OBJ_PAYLOAD(bo)[0] = (u32)-100;          /* slot 0 = value    */
+        const NativeEntry *bv = native_lookup("java/lang/Integer",
+                                              "byteValue", "()B");
+        CHECK(bv != 0, "Integer: byteValue()B registered (WWG text decode)");
+        if (bv) {
+            a[0].ref = box;
+            bv->fn(a, 1, r);
+            CHECK((s32)(s8)r[0].w == -100, "Integer: byteValue narrows -100");
+        }
+    }
+
+    /* Thread.activeCount: cooperative single thread -> 1             */
+    {
+        const NativeEntry *ac = native_lookup("java/lang/Thread",
+                                              "activeCount", "()I");
+        CHECK(ac != 0, "Thread: activeCount()I registered");
+        if (ac) { ac->fn(a, 0, r); CHECK((s32)r[0].w == 1,
+                 "Thread: activeCount() == 1 (cooperative)"); }
+    }
+
+    /* Command ctor stores label/type/priority; Displayable no-ops    */
+    {
+        JRef cmd = ref_alloc(T_OBJECT, 16,
+                             class_load("javax/microedition/lcdui/Command"));
+        const NativeEntry *ci = native_lookup("javax/microedition/lcdui/Command",
+            "<init>", "(Ljava/lang/String;II)V");
+        CHECK(ci != 0, "lcdui: Command ctor registered (WWG softkeys)");
+        if (ci) {
+            JRef lab = intern_str("Exit");
+            a[0].ref = cmd; a[1].ref = lab; a[2].w = 1; a[3].w = 2;
+            ci->fn(a, 4, r);
+            JObj *co = obj(cmd);
+            CHECK(co && OBJ_PAYLOAD(co)[1] == (u32)lab
+                  && OBJ_PAYLOAD(co)[2] == 1 && OBJ_PAYLOAD(co)[3] == 2,
+                  "lcdui: Command stores label/type/priority");
+        }
+        CHECK(native_lookup("javax/microedition/lcdui/Displayable",
+                           "addCommand",
+                           "(Ljavax/microedition/lcdui/Command;)V") != 0
+              && native_lookup("javax/microedition/lcdui/Displayable",
+                               "setCommandListener",
+                               "(Ljavax/microedition/lcdui/CommandListener;)V")
+                 != 0,
+              "lcdui: Displayable addCommand/setCommandListener registered");
+        CHECK(native_lookup("javax/microedition/midlet/MIDlet",
+                           "<init>", "()V") != 0,
+              "MIDlet: <init>()V registered (super() chain)");
+        CHECK(native_lookup("javax/microedition/lcdui/Canvas",
+                           "<init>", "()V") != 0,
+              "Canvas: <init>()V registered (super() chain)");
+        CHECK(native_lookup("javax/microedition/media/Manager", "createPlayer",
+              "(Ljava/io/InputStream;Ljava/lang/String;)"
+              "Ljavax/microedition/media/Player;") != 0,
+              "media: createPlayer(InputStream,String) registered (WWG music)");
+    }
+
+    /* new String(char[], off, len): handle rebind, UTF-16 payload    */
+    {
+        JRef ca = ref_alloc(T_ARR_C, 4 + 2 * 4, 0);
+        JObj *co = obj(ca);
+        ARR_LEN(co) = 4;
+        u16 *cd = (u16 *)ARR_DATA(co);
+        cd[0] = 'W'; cd[1] = 'e'; cd[2] = 's'; cd[3] = 't';
+        JRef s = ref_alloc(T_OBJECT, 16, class_load("java/lang/String"));
+        const NativeEntry *sc = native_lookup("java/lang/String", "<init>",
+                                              "([CII)V");
+        CHECK(sc != 0, "String: <init>([CII)V registered (WWG char path)");
+        if (sc) {
+            a[0].ref = s; a[1].ref = ca; a[2].w = 1; a[3].w = 2;
+            sc->fn(a, 4, r);
+            CHECK(obj(s) && obj(s)->type == T_ARR_C && jstr_eq(s, "es"),
+                  "String: new String(char[],1,2) rebinds to \"es\"");
+            a[0].ref = s; a[1].ref = ca; a[2].w = 0; a[3].w = 4;
+            sc->fn(a, 4, r);
+            CHECK(jstr_eq(s, "West"),
+                  "String: new String(char[],0,4) full window");
+            a[0].ref = s; a[1].ref = ca; a[2].w = 3; a[3].w = 9;
+            sc->fn(a, 4, r);
+            CHECK(fpj_pending_exc != 0,
+                  "String: [CII bounds raise StringIndexOutOfBounds");
+            JObj *eo = obj(fpj_pending_exc);
+            CHECK(eo && eo->clazz
+                  && !strcmp(((JClass *)eo->clazz)->name,
+                             "java/lang/StringIndexOutOfBoundsException"),
+                  "String: the thrown class is StringIndexOutOfBounds");
+            fpj_pending_exc = 0;
+        }
+    }
+}
+
+/* ---- Round 10 (UsbCast): the raw RGB565 blit, C-level ---------------
+ * One row = one memcpy; 0x0000 must stay 0x0000 (no PX_TRANS remap:
+ * a cast frame may legitimately be pure black), and the clip must
+ * cut both rows and columns exactly like gfx_draw_rgb.            */
+static void test_cast_blit(void)
+{
+    u8 src[2 * 4 * 8];                       /* 8 wide x 4 tall, scan 8 */
+    for (u32 i = 0; i < 4 * 8; i++) {        /* pixel i = 0x0300 | i   */
+        u16 v = (u16)(0x0300 | i);
+        src[2 * i] = (u8)v;
+        src[2 * i + 1] = (u8)(v >> 8);
+    }
+    JImage t = { FP_LCD_W, FP_LCD_H, fp_screen, 1 };
+    MGraphics g;
+    memset(fp_screen, 0xAA, sizeof fp_screen);
+    gfx_reset(&g, &t);
+    gfx_draw_rgb565(&g, src, 0, 8, 2, 3, 8, 4);
+    CHECK(fp_screen[3 * 128 + 2] == (0x0300 | 0) &&
+          fp_screen[3 * 128 + 9] == (0x0300 | 7) &&
+          fp_screen[6 * 128 + 2] == (0x0300 | 24) &&
+          fp_screen[6 * 128 + 9] == (0x0300 | 31),
+          "blit: RGB565 byte pairs land LE-exact (incl 0x0300)");
+    CHECK(fp_screen[3 * 128 + 1] == 0xAAAA && fp_screen[6 * 128 + 10] == 0xAAAA,
+          "blit: nothing bleeds outside the 8x4 rect");
+    /* clip: same blit shifted so only 3x2 of it intersects the screen */
+    memset(fp_screen, 0xAA, sizeof fp_screen);
+    gfx_reset(&g, &t);
+    gfx_draw_rgb565(&g, src, 0, 8, -5, -2, 8, 4);
+    CHECK(fp_screen[0] == (0x0300 | (2 * 8 + 5)) &&
+          fp_screen[1] == (0x0300 | (2 * 8 + 6)) &&
+          fp_screen[2] == (0x0300 | (2 * 8 + 7)) &&
+          fp_screen[128] == (0x0300 | (3 * 8 + 5)) &&
+          fp_screen[129] == (0x0300 | (3 * 8 + 6)) &&
+          fp_screen[130] == (0x0300 | (3 * 8 + 7)) &&
+          fp_screen[3] == 0xAAAA && fp_screen[256] == 0xAAAA,
+          "blit: clip keeps the 3x2 intersection, row pitch intact");
+    /* pure black fidelity: 0x0000 payload stays 0x0000 on the target */
+    u8 black[4] = { 0, 0, 0, 0 };
+    memset(fp_screen, 0xAAAA, sizeof fp_screen);
+    gfx_reset(&g, &t);
+    gfx_draw_rgb565(&g, black, 0, 2, 0, 0, 2, 1);
+    CHECK(fp_screen[0] == 0x0000 && fp_screen[1] == 0x0000,
+          "blit: exact 0x0000 (pure black) is NOT remapped to PX_BLACK");
+}
+
+/* ---- Round 10 (UsbCast): full MIDlet boot through the mock pipe -----
+ * Two casts: (a) 2 frames then link-EOF -> the phone-side loop sees
+ * read() == -1 and exits cleanly (host-side EOF stands in for what the
+ * phone reaches with the EXIT KEY); (b) 1 frame, NO EOF, a RSOFT press
+ * lands while a native read is BLOCKED -> close() must abort it.
+ * Both verify the full stack: jar -> VM -> Connector -> USB natives ->
+ * drawPixels blit -> repaint/serviceRepaints -> ACK on the wire.     */
+static u8 *cast_frame(u8 *dst, int n)
+{
+    dst[0] = 'F'; dst[1] = 'P'; dst[2] = 'J'; dst[3] = '2';
+    dst[4] = 128; dst[5] = 0; dst[6] = 160; dst[7] = 0; dst[8] = 0;
+    for (u32 i = 0; i < 128 * 160; i++) {
+        u16 v = (u16)(0x1000 * (u16)n + i);      /* per-frame, per-px  */
+        dst[9 + 2 * i] = (u8)v;
+        dst[9 + 2 * i + 1] = (u8)(v >> 8);
+    }
+    return dst;
+}
+
+static int cast_stat(JClass *cs, const char *name)
+{
+    for (u16 i = 0; cs && i < cs->n_fields; i++)
+        if (!strcmp(cs->fields[i].name, name))
+            return (s32)cs->fields[i].static_val;
+    return -1;
+}
+
+static void test_usbcast(void)
+{
+    u8 *f = (u8 *)malloc(9 + 40960);
+    CHECK(f != 0, "usbcast: frame scratch");
+
+    /* (a) two frames, then link EOF: run() returns, boot returns 0   */
+    fpj2me_shutdown();
+    fp_usb_mock_reset();
+    fp_usb_mock_feed(cast_frame(f, 1), 9 + 40960);
+    fp_usb_mock_feed(cast_frame(f, 2), 9 + 40960);
+    fp_usb_mock_eof();
+    CHECK(fpj2me_boot("UsbCast.jar") == 0,
+          "usbcast: boot -> 2 frames -> EOF -> clean exit to launcher");
+    JClass *cs = class_load("CastScr");
+    CHECK(cast_stat(cs, "frames") == 2, "usbcast: 2 frames decoded");
+    CHECK(cast_stat(cs, "acks") == 2, "usbcast: 2 ACKs sent");
+    CHECK(cast_stat(cs, "painted") >= 2,
+          "usbcast: paint delivered for every frame");
+    {
+        unsigned tlen; const u8 *tx = fp_usb_mock_tx(&tlen);
+        CHECK(tlen == 4 && tx[0] == 'R' && tx[1] == 'K' && tx[2] == 'K'
+              && tx[3] == 'Q',
+              "usbcast: wire = R K K Q (ready/ack/ack/quit)");
+    }
+    CHECK(fp_screen[0] == (0x2000 | 0) &&
+          fp_screen[7777] == (0x2000 | 7777) &&
+          fp_screen[128 * 160 - 1] == (0x2000 | 20479),
+          "usbcast: frame-2 payload is pixel-exact on the LCD");
+
+    /* Round 12: the payload must move as full-size bulk read([BII)
+     * requests into the pre-allocated byte[] — test (a) streamed two
+     * 40,960-byte frames, so exactly two >= 4 KB reads must have hit
+     * the pipe (never single-byte payload loops).                    */
+    CHECK(usb_bulk_reads == 2,
+          "usbfast: payload arrives as 2 full-size bulk reads ([BII)");
+
+    /* (b) ONE frame, no EOF: RSOFT while a read blocks -> abort      */
+    fpj2me_shutdown();
+    fp_usb_mock_reset();
+    fp_usb_mock_feed(cast_frame(f, 3), 9 + 40960);
+    key_script_use(soft2_script, 2);
+    key_block_rearm = 1;   /* RSOFT fires at the first blocked read */
+    CHECK(fpj2me_boot("UsbCast.jar") == 0,
+          "usbcast: exit key ALWAYS breaks a blocked USB read");
+    cs = class_load("CastScr");
+    CHECK(cast_stat(cs, "frames") == 1, "usbcast: 1 frame before exit");
+    {
+        unsigned tlen; const u8 *tx = fp_usb_mock_tx(&tlen);
+        CHECK(tlen == 3 && tx[0] == 'R' && tx[1] == 'K' && tx[2] == 'Q',
+              "usbcast: wire = R K Q (exit mid-stream)");
+    }
+
+    /* (c) Round 12 tight-loop pins, drip mode: the frame is released
+     * 128 bytes per fp_usb_read call (each call = 1 ms virtual wire
+     * time). usb_fill must NEVER sleep while payload is pending (the
+     * Round 11 code slept 2 ms per gap = the 0.2 fps stall), and a
+     * RSOFT press armed at drip call 64 — deep inside the payload —
+     * must abort the bulk read through the ~16 ms keypad poll: zero
+     * frames complete, wire R Q.                                    */
+    fpj2me_shutdown();
+    fp_usb_mock_reset();
+    fp_usb_mock_feed(cast_frame(f, 4), 9 + 40960);
+    key_script_use(soft2_script, 2);
+    usb_drip_chunk = 128;      /* simulate 64-byte wire cadence      */
+    usb_drip_calls = 0;
+    usb_midframe_rearm = 1;    /* RSOFT lands mid-payload            */
+    CHECK(fpj2me_boot("UsbCast.jar") == 0,
+          "usbfast: drip-mode boot ends cleanly");
+    CHECK(usb_sleep_pending == 0,
+          "usbfast: bulk RX never sleeps while payload streams");
+    cs = class_load("CastScr");
+    CHECK(cast_stat(cs, "frames") == 0,
+          "usbfast: mid-frame exit key aborts the payload read");
+    {
+        unsigned tlen; const u8 *tx = fp_usb_mock_tx(&tlen);
+        CHECK(tlen == 2 && tx[0] == 'R' && tx[1] == 'Q',
+              "usbfast: wire = R Q (abort before the first ACK)");
+    }
+    usb_drip_chunk = 0;        /* drip off for any later suite run   */
+    free(f);
+}
+
 int main(void)
 {
     test_jar();
     test_transforms();
+    test_arcs();
     test_clip_fill_string();
     test_setclip_replace_black();
     test_ac1_natives();
@@ -1154,11 +2099,16 @@ int main(void)
     test_gc();
     test_fatal_diag();
     test_cp_cache();
+    test_math();
+    test_exc_ctor();
+    test_wwg_natives();
     test_nokia_sound();
     test_app_property();
     test_lcd_portrait();
     test_lcd_flush_gate();
     test_portrait_keypad();
+    test_cast_blit();
+    test_usbcast();
     printf("\n%s (%d failure%s)\n", fails ? "RESULT: FAIL" : "RESULT: ALL PASS",
            fails, fails == 1 ? "" : "s");
     return fails ? 1 : 0;

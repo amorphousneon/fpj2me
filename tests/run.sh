@@ -8,6 +8,12 @@ mkdir -p /tmp/fpj2me/rms/tests
 python3 tools/make_test_jar.py
 python3 tools/make_deep_jar.py
 
+# Round 12 fix: generate UsbCast.jar BEFORE the hostcheck run. The old
+# order (generate after) left /tmp/fpj2me/UsbCast.jar missing/stale on
+# a fresh /tmp — hostcheck's usbcast suite booted nothing and failed.
+python3 tools/make_usbcast_jar.py
+cp tests/UsbCast.jar /tmp/fpj2me/UsbCast.jar
+
 # the VM boots "game.jar" from FPJ_SD_ROOT (relative paths like on
 # target; the MIDlet-1 attributes come from the jar's own manifest)
 cp tests/test.jar /tmp/fpj2me/game.jar
@@ -55,3 +61,15 @@ gcc -std=c99 -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable \
 ./tests/boot_jar tests/deep.jar 36 >/dev/null 2>&1 \
     && echo "PASS  boot 24-deep chain in 36KB-stack thread" \
     || { echo "FAIL  boot 24-deep chain in 36KB-stack thread"; exit 1; }
+
+# ---- Round 10: UsbCast.jar boot check -----------------------------------
+# UsbCast is a first-class jar now: booted in the 36 KB-stack thread
+# with two synthetic USB frames fed through the mock pipe
+# (FPJ_USB_FRAMES=2 -> R K K Q on the wire, then link-EOF exit).
+# The jar itself is generated at the TOP of this script (Round 12
+# moved the step there so hostcheck boots the same fresh jar).
+# hostcheck.c additionally covers the full blit + exit-key path.
+FPJ_USB_FRAMES=2 ./tests/boot_jar /tmp/fpj2me/UsbCast.jar 36 >/dev/null 2>/tmp/usbcast_boot.err \
+    && grep -q "RKKQ" /tmp/usbcast_boot.err \
+    && echo "PASS  UsbCast.jar boots, 2 frames, wire = RKKQ (36KB stack)" \
+    || { echo "FAIL  UsbCast.jar boot"; cat /tmp/usbcast_boot.err; exit 1; }

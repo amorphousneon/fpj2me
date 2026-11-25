@@ -62,12 +62,21 @@ typedef struct MGraphics {
 /* midp_graphics.c */
 void gfx_reset(MGraphics *g, JImage *target);
 void gfx_clip(MGraphics *g, int x, int y, int w, int h);   /* setClip   */
+void gfx_clip_rect(MGraphics *g, int x, int y, int w, int h); /* clipRect */
 void gfx_translate(MGraphics *g, int dx, int dy);
 void gfx_color_rgb(MGraphics *g, int r, int gg, int b);
 void gfx_color_int(MGraphics *g, u32 argb);
 void gfx_fill_rect(MGraphics *g, int x, int y, int w, int h);
 void gfx_draw_rect(MGraphics *g, int x, int y, int w, int h);
 void gfx_draw_line(MGraphics *g, int x1, int y1, int x2, int y2);
+/* arcs (Round 9): drawArc/fillArc share the parametric stepper —
+ * fill=1 fills the PIE; angles in MIDP degrees (0 = 3 o'clock, CCW) */
+void gfx_arc(MGraphics *g, int x, int y, int w, int h,
+             int start, int sweep, int fill);
+void gfx_draw_roundrect(MGraphics *g, int x, int y, int w, int h,
+                        int arcw, int arch);
+/* shared pure-C sin/cos (Math natives + arc stepper; no libm)      */
+void gfx_sincos(double x, double *so, double *co);
 void gfx_fill_triangle(MGraphics *g, int x1, int y1, int x2, int y2,
                        int x3, int y3);
 void gfx_draw_image(MGraphics *g, const JImage *im,
@@ -77,6 +86,12 @@ void gfx_draw_region(MGraphics *g, const JImage *src,
                      int dx, int dy, int anchor);
 void gfx_draw_rgb(MGraphics *g, const u32 *rgb, int off, int scanlen,
                   int x, int y, int w, int h, int process_alpha);
+/* Round 10 (UsbCast): raw little-endian RGB565 byte-pair blit —
+ * the zero-conversion fast path behind DirectGraphics.drawPixels
+ * (TYPE_USHORT_565_RGB, identity manipulation). Full fidelity:
+ * no PX_TRANS remap, an exact 0x0000 stays 0x0000.                */
+void gfx_draw_rgb565(MGraphics *g, const u8 *px, int off, int scanlen,
+                     int x, int y, int w, int h);
 void gfx_draw_string(MGraphics *g, const char *utf8,
                      int x, int y, int anchor);
 int  gfx_char_width(void);  int gfx_string_height(void);

@@ -124,6 +124,155 @@ void gfx_draw_line(MGraphics *g, int x1, int y1, int x2, int y2)
     }
 }
 
+/* ---- shared pure-C trigonometry (no libm: -nostdlib target) ---------
+ * Quadrant reduction + degree-11 Taylor kernels, |r| <= PI/4:
+ * error < 1e-11 there, ~1e-10 even at |x| = 1e6 — far past what a
+ * 128x160 game needs. Shared by Math.sin/cos/tan (natives.c) AND
+ * the arc stepper below, so the trig exists exactly once.          */
+static double sin_kernel(double x)
+{
+    double x2 = x * x;
+    double p = -1.0 / 39916800.0;          /* -1/11!                  */
+    p = p * x2 + 1.0 / 362880.0;
+    p = p * x2 - 1.0 / 5040.0;
+    p = p * x2 + 1.0 / 120.0;
+    p = p * x2 - 1.0 / 6.0;
+    p = p * x2 + 1.0;
+    return x * p;
+}
+static double cos_kernel(double x)
+{
+    double x2 = x * x;
+    double p = -1.0 / 3628800.0;           /* -1/10!                  */
+    p = p * x2 + 1.0 / 40320.0;
+    p = p * x2 - 1.0 / 720.0;
+    p = p * x2 + 1.0 / 24.0;
+    p = p * x2 - 0.5;
+    p = p * x2 + 1.0;
+    return p;
+}
+void gfx_sincos(double x, double *so, double *co)
+{
+    double y = x * 0.6366197723675814;     /* 2/PI                    */
+    double kd = y + (y >= 0 ? 0.5 : -0.5);
+    s64 k = (s64)kd;
+    double r = x - (double)k * 1.5707963267948966;  /* x - k*PI/2    */
+    double s = sin_kernel(r), c = cos_kernel(r);
+    switch (((k % 4) + 4) % 4) {
+    case 0: *so =  s; *co =  c; break;
+    case 1: *so =  c; *co = -s; break;
+    case 2: *so = -s; *co = -c; break;
+    default:*so = -c; *co =  s; break;
+    }
+}
+
+static int irnd(double v) { return (int)(v + (v >= 0 ? 0.5 : -0.5)); }
+
+/* ---- arcs / round rects (Round 9 — Wild West Guns) ------------------
+ * One parametric ellipse stepper serves drawArc / fillArc / round
+ * corners. MIDP angle convention (JSR-118): 0° = 3 o'clock, positive
+ * = counter-clockwise ON SCREEN (so y = cy - ry*sin t). Boundary
+ * points step at <= 0.5 px of rim; drawArc chains them with lines,
+ * fillArc fills the PIE with center spokes ("the arc is filled as a
+ * pie slice" — spokes at <= 0.5 px rim pitch leave no pinholes), a
+ * full ±360° sweep degenerates into the complete disk/outline.
+ * sin/cos advance INCREMENTALLY (rotation recurrence, 6 soft-double
+ * multiplies per step) instead of reduction+polynomial per point;
+ * the drift stays ~1e-12 over the <= 8000 steps a screen-sized arc
+ * needs, and the final point lands exactly on the end angle. All
+ * rasterization funnels through gfx_draw_line, so translate + clip
+ * behave exactly like every other primitive here.                    */
+void gfx_arc(MGraphics *g, int x, int y, int w, int h,
+             int start, int sweep, int fill)
+{
+    if (w <= 0 || h <= 0) return;          /* point/empty: nothing    */
+    double rx = 0.5 * (double)w, ry = 0.5 * (double)h;
+    double cx = x + rx, cy = y + ry;
+    double rmax = rx > ry ? rx : ry;       /* rim-pitch driver        */
+    double dt = 0.5 / rmax;                /* <= 0.5 px arc-length/step */
+    if (dt > 0.25)  dt = 0.25;             /* tiny arcs stay sane     */
+    double span = (double)sweep * 0.017453292519943295;
+    if (span == 0.0) return;               /* zero sweep: Java no-op  */
+    if (span >  6.283185307179586) span =  6.283185307179586;
+    if (span < -6.283185307179586) span = -6.283185307179586;
+    if (dt * 8000.0 < (span < 0 ? -span : span))
+        dt = (span < 0 ? -span : span) / 8000.0;   /* bound the steps */
+    double dir = (span > 0) ? dt : -dt;
+    double a0 = (double)start * 0.017453292519943295;
+    double a1 = a0 + span;                 /* exact end angle         */
+
+    double s, c, sd, cd;
+    gfx_sincos(a0, &s, &c);                /* (cos t, sin t) from now */
+    gfx_sincos(dir, &sd, &cd);             /* the one-step rotation   */
+    int icx = irnd(cx), icy = irnd(cy);
+    int px = irnd(cx + rx * c), py = irnd(cy - ry * s);
+    if (fill)
+        gfx_draw_line(g, icx, icy, px, py);        /* pie edge #1     */
+    double remaining = span - dir;
+    for (;;) {
+        double ns = s * cd + c * sd;       /* rotate (c, s) by dir    */
+        double nc = c * cd - s * sd;
+        s = ns; c = nc;
+        remaining -= dir;
+        int last = (dir > 0 ? remaining <= 0.0 : remaining >= 0.0);
+        if (last)
+            gfx_sincos(a1, &s, &c);        /* land exactly on the end */
+        int nx = irnd(cx + rx * c), ny = irnd(cy - ry * s);
+        if (fill)
+            gfx_draw_line(g, icx, icy, nx, ny);     /* spoke          */
+        else
+            gfx_draw_line(g, px, py, nx, ny);       /* rim segment    */
+        px = nx; py = ny;
+        if (last) break;
+    }
+    if (fill)
+        gfx_draw_line(g, icx, icy, px, py);        /* pie edge #2     */
+}
+
+/* MIDP drawRoundRect: 4 edges + 4 quarter-ellipse corners. arcw/arch
+ * are the corner-oval DIAMETERS (JSR-118) -> semi-axes arcw/2,
+ * arch/2, clamped to half the rect. Edge/corner geometry matches
+ * gfx_draw_rect's inclusive (x+w-1) convention.                      */
+void gfx_draw_roundrect(MGraphics *g, int x, int y, int w, int h,
+                        int arcw, int arch)
+{
+    if (w <= 0 || h <= 0) return;
+    if (arcw < 0) arcw = 0;
+    if (arch < 0) arch = 0;
+    int rx = arcw / 2, ry = arch / 2;
+    if (rx * 2 > w) rx = w / 2;
+    if (ry * 2 > h) ry = h / 2;
+    int x1 = x + w - 1, y1 = y + h - 1;
+    gfx_draw_line(g, x + rx, y,      x1 - rx, y);       /* top       */
+    gfx_draw_line(g, x + rx, y1,     x1 - rx, y1);      /* bottom    */
+    gfx_draw_line(g, x,      y + ry, x,      y1 - ry);  /* left      */
+    gfx_draw_line(g, x1,     y + ry, x1,     y1 - ry);  /* right     */
+    /* quarter corners: gfx_arc takes the corner-ellipse BBOX top-left
+     * (w = 2*rx, h = 2*ry) — its center then lands exactly on
+     * (x+rx, y+ry) / (x1-rx, ...) and spans edge-point to side      */
+    gfx_arc(g, x,          y,          2 * rx, 2 * ry,  90,  90, 0); /* TL */
+    gfx_arc(g, x1 - 2*rx,  y,          2 * rx, 2 * ry,   0,  90, 0); /* TR */
+    gfx_arc(g, x1 - 2*rx,  y1 - 2*ry,  2 * rx, 2 * ry, 270,  90, 0); /* BR */
+    gfx_arc(g, x,          y1 - 2*ry,  2 * rx, 2 * ry, 180,  90, 0); /* BL */
+}
+
+/* MIDP clipRect: INTERSECT (never replace — that's setClip; see the
+ * setClip comment above for why the distinction matters to GLLib).
+ * Rectangle is in translated coordinates; a negative w/h empties.   */
+void gfx_clip_rect(MGraphics *g, int x, int y, int w, int h)
+{
+    int x0 = x + g->tx, y0 = y + g->ty;
+    int x1 = x0 + w,    y1 = y0 + h;
+    int cx1 = g->cx + g->cw, cy1 = g->cy + g->ch;
+    if (x0 < g->cx) x0 = g->cx;
+    if (y0 < g->cy) y0 = g->cy;
+    if (x1 > cx1) x1 = cx1;
+    if (y1 > cy1) y1 = cy1;
+    g->cw = (x1 > x0) ? (short)(x1 - x0) : 0;
+    g->ch = (y1 > y0) ? (short)(y1 - y0) : 0;
+    g->cx = (short)x0; g->cy = (short)y0;
+}
+
 
 /* Graphics.fillTriangle(x1,y1,x2,y2,x3,y3): scanline fill with the
  * vertices sorted by y, x interpolated down the long edge (v1->v3)
@@ -317,5 +466,35 @@ void gfx_draw_string(MGraphics *g, const char *s,
                     t->px[(size_t)py * t->w + px] = g->color;
             }
         }
+    }
+}
+
+/* ---- Round 10 (UsbCast): raw RGB565 byte-pair blit --------------------
+ * gfx_draw_rgb565: px[] holds little-endian RGB565 pairs (b0 low,
+ * b1 high) exactly as the USB cast protocol delivers them and as
+ * ARM/x86 store u16s in memory, so each clipped row is ONE memcpy —
+ * no per-pixel math, no allocation, no PX_TRANS remap (0x0000 stays
+ * 0x0000: a cast frame may legitimately be pure black). This is the
+ * engine behind DirectGraphics.drawPixels(byte[], null, ...) with
+ * TYPE_USHORT_565_RGB + identity manipulation.                        */
+void gfx_draw_rgb565(MGraphics *g, const u8 *px, int off, int scanlen,
+                     int x, int y, int w, int h)
+{
+    if (w <= 0 || h <= 0 || !px || !g || !g->target) return;
+    x += g->tx; y += g->ty;
+    int x0 = x, y0 = y, x1 = x + w, y1 = y + h;
+    if (x0 < g->cx) x0 = g->cx;
+    if (y0 < g->cy) y0 = g->cy;
+    if (x1 > g->cx + g->cw) x1 = g->cx + g->cw;
+    if (y1 > g->cy + g->ch) y1 = g->cy + g->ch;
+    if (x0 >= x1 || y0 >= y1) return;
+
+    JImage *t = g->target;
+    const u8 *base = px + off;                 /* off is in BYTES     */
+    int rowbytes = (x1 - x0) * 2;
+    for (int yy = y0; yy < y1; yy++) {
+        u16 *d = t->px + (size_t)yy * t->w + x0;
+        const u8 *s = base + ((size_t)(yy - y) * scanlen + (x0 - x)) * 2;
+        memcpy(d, s, (size_t)rowbytes);        /* LE pairs == u16 LE  */
     }
 }

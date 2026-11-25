@@ -182,6 +182,20 @@ int main(int argc, char **argv)
     fp_lcd_flush();                 /* refresh again, now lit            */
     { int key; while (sys_event(&key) != EVENT_END); }   /* drain */
 
+    /* ---- Round 11: cold-boot USB device enumeration ------------------
+     * Under sdboot (LIBC_SDIO=3) the SC6531E UDC is powered down when
+     * we start: no AHB island power, no LDO_USB -> no D+ pull-up ->
+     * plugging the phone into Linux showed NOTHING in lsusb/dmesg.
+     * fp_usb_init() replays the OEM firmware's own UDC cold init
+     * (AHB power bit 4 + GR 0x8B000220 bit 5 + 300 ms settle +
+     * SELF_PWR/USB_EN + usb_init() endpoint arming + LDO_USB power
+     * cycle) and is idempotent: under the LIBC_SDIO<3 FDL path it
+     * detects the live controller and adopts it untouched. After it
+     * returns, a plugged host sees 1782:4d00; fp_sleep_ms() services
+     * EP0 while the UI idles, so enumeration completes without any
+     * MIDlet holding the pipe.                                       */
+    fp_usb_init();
+
     for (;;) {
         char jar[32];
 

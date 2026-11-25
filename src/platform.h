@@ -70,6 +70,46 @@ int      fp_fseek(fp_file *f, long off, int whence); /* SEEK_SET/CUR/END */
 long     fp_ftell(fp_file *f);
 int      fp_fclose(fp_file *f);
 
+/* ----- USB cast transport (Round 10) ----------------------------------
+ * Backed on the target by fpdoom's usbio.c (compiled into the same
+ * image: SYS_SRCS). The phone's USB device controller comes up as a
+ * raw vendor-class pipe configured by the BOOTLOADER:
+ *   VID 0x1782 / PID 0x4D00, class 0xFF, 64-byte bulk packets,
+ *   EP OUT 0x02 (phone receives) / EP IN 0x83 (phone transmits).
+ * No kernel driver binds on the host -> talk to it with libusb
+ * (pyusb), NOT /dev/ttyACM*.
+ * The fpdoom RX side is a 2 KB ring; when it is full the hardware
+ * NAKs further OUT packets, so a fast host cannot lose data - it
+ * simply waits (hardware backpressure).
+ *
+ * Round 11: under sdboot (LIBC_SDIO=3) the controller is COLD - the
+ * bootloader that armed it in the FDL case never ran. fp_usb_init()
+ * powers it up from scratch so a plugged host enumerates 1782:4d00.
+ * It is idempotent: if USB is already live (LIBC_SDIO<3 FDL session)
+ * it adopts the controller untouched, so it never resets endpoints
+ * under a host.                                                    */
+/* Cold-boot bring-up of the SC6531E USB device controller (target:
+ * AHB power island + GR module bit + LDO_USB power cycle around
+ * fpdoom's proven usb_init() endpoint arming). Returns 0 when the
+ * pipe is usable (brought up now, or already live and adopted),
+ * -1 on failure (host mock: when told to fail). Idempotent.     */
+int  fp_usb_init(void);
+/* Single DRAIN-TO-EMPTY pass (Round 12): pumps the UDC interrupt
+ * handler (EP0/EP2/EP3) whenever the 2 KB RX ring has room, then
+ * moves up to len queued bytes into dst. Returns the count moved
+ * (0 = nothing queued right now), or -1 when the link is gone
+ * (host-side mock EOF; the target never reports EOF). The blocking
+ * tight-loop that spins this is usb_fill() in natives.c — it never
+ * sleeps while payload bytes are pending.                        */
+int  fp_usb_read(void *dst, unsigned len);
+/* Blocking write (target: fpdoom chunks it into 64-byte packets).
+ * Returns len, or -1 on failure.                                  */
+int  fp_usb_write(const void *src, unsigned len);
+/* Bytes currently readable without blocking (a hint, >= 0).       */
+unsigned fp_usb_available(void);
+/* Drop transport state for a fresh suite boot (no-op on target). */
+void fp_usb_reset(void);
+
 /* App dir on SD. Under sdboot the app's working directory IS its game
  * folder (fpdoom finds doom1.wad the same way), so paths are RELATIVE:
  *   boot.jar    - compiled java.lang + java.util subset (M2+)

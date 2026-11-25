@@ -503,7 +503,17 @@ void fp_lcd_wait(void)  { fpj_lcdc_wait_frame(); }
 
 /* ---- time / debug ---------------------------------------------------- */
 uint32_t fp_time_ms(void)      { return sys_timer_ms(); }
-void     fp_sleep_ms(uint32_t ms) { sys_wait_ms(ms); }
+
+/* Round 11: the USB idle pump runs from every sleep (see the end of
+ * this file); forward-declared here because fp_sleep_ms sits above
+ * the USB section.                                                     */
+static void fpj_usb_pump(void);
+
+void     fp_sleep_ms(uint32_t ms)
+{
+    fpj_usb_pump();            /* service EP0 while the UI idles     */
+    sys_wait_ms(ms);
+}
 
 void fp_dbg(const char *s) { printf("%s\n", s); }
 
@@ -613,3 +623,191 @@ void  fp_free(void *p)      { free(p); }
 /* ---- libc string surface (fpdoom libc.c / common.c provide these) ---- */
 /* Declared in libc_shims.h; if your fpdoom build lacks one of them,
  * add a 5-line fallback here.                                          */
+
+/* ---- USB cast transport (Round 10) ------------------------------------
+ * fpdoom's usbio.c is compiled into this very image (SYS_SRCS in
+ * build_sc6531.make), so its raw-bulk primitives are linkable here:
+ *   usb_read(dst, len, USB_NOWAIT)  pumps the 2 KB RX ring (services
+ *                                    EP2 interrupts) and drains it;
+ *   usb_write(src, len)             blocking TX on EP3, 64-byte
+ *                                    chunks (returns len).
+ * Device side (Round 11 cold-boot: fp_usb_init() below):
+ *   VID 0x1782 / PID 0x4D00, vendor class 0xFF, 2 endpoints,
+ *   EP OUT 0x02 (phone RX) / EP IN 0x83 (phone TX), max packet 64.
+ * With LIBC_SDIO=3 nothing else in the image touches USB (the
+ * libc_server handshake and _debug_msg are compiled out), so the
+ * pipe is exclusively ours while a MIDlet holds it open.
+ * Round 11: fp_usb_init() arms the controller from a cold sdboot
+ * (see below); we never re-run it under a live link.
+ *
+ * Round 12 — TIGHT-LOOP BULK RX CONTRACT. fp_usb_read() is one full
+ * DRAIN-TO-EMPTY pass: usb_read(dst, len, USB_NOWAIT) loops
+ * "usb_check_int() while the ring has >= 64 bytes free, then copy
+ * out what arrived" until the ring goes empty, so ONE call services
+ * the UDC interrupts (EP0 enumeration included) AND moves every
+ * queued byte. The blocking state machine that CALLS this in a
+ * tight spin — no fp_sleep_ms while payload is streaming, ~16 ms
+ * keypad/abort polling, sleep only before the first byte — is
+ * usb_fill() in natives.c (shared verbatim with the host checks,
+ * which is why it lives there and not here: the host mock pipe is
+ * synchronous and cannot block inside a platform primitive).
+ * The old fill loop's fp_sleep_ms(2) per partial drain quantized to
+ * a 10-16 ms hardware-timer tick on the SC6531E — 641 packets per
+ * frame, >5 s per frame, the 0.2 fps cast and the host ACK
+ * timeouts. Never sleep on this path while data is pending.       */
+#include "usbio.h"
+
+/* usbio.c keeps its ring private (usbio.h has no struct); the layout
+ * is fixed for the fpdoom tree this app builds against: 0x800-byte
+ * power-of-two ring + USB_MAXREAD(64) overflow margin. Declared here
+ * ONLY to give available() an honest byte count.                     */
+#define FPJ_USB_BUFSIZE 0x800
+typedef struct { uint32_t rpos, wpos; uint8_t buf[FPJ_USB_BUFSIZE + 64]; } fpj_usb_buf_t;
+extern fpj_usb_buf_t usb_buf;
+
+int fp_usb_read(void *dst, unsigned len)
+{
+    /* single drain-to-empty pass; also services USB interrupts
+     * (usb_check_int: EP0/EP2/EP3) while the ring has room — the
+     * tight-loop caller (usb_fill) spins this to keep the 2 KB ring
+     * from ever wedging full or NAKing EP2 OUT longer than one pass */
+    return usb_read(dst, len, USB_NOWAIT);
+}
+
+int fp_usb_write(const void *src, unsigned len)
+{
+    if (!len) return 0;
+    return usb_write(src, len) == (int)len ? (int)len : -1;
+}
+
+unsigned fp_usb_available(void)
+{
+    return (unsigned)((usb_buf.wpos - usb_buf.rpos) & (FPJ_USB_BUFSIZE - 1));
+}
+
+void fp_usb_reset(void)
+{
+    /* ring + endpoints belong to the bootloader session; a MIDlet
+     * always starts from a drained, consistent state. No-op.          */
+}
+
+/* ---- Round 11: cold-boot USB enumeration (1782:4d00) -----------------
+ *
+ * THE BUG: fpj2me.bin booted from microSD via sdboot never showed up
+ * in lsusb/dmesg on Linux. Two independent causes:
+ *
+ *   (1) usbio.c's comment says it all: "USB is already initialized
+ *       by the bootloader" - true for the LIBC_SDIO<3 FDL path (the
+ *       host loaded us over USB, so FDL1/ROM left the controller
+ *       powered and armed), FALSE for sdboot. entry.c arms the UDC
+ *       only inside `#if LIBC_SDIO < 3`; with LIBC_SDIO=3 nothing in
+ *       the whole image ever touches USB.
+ *
+ *   (2) Even "just call usb_init()" is not enough: cold, the SC6531E
+ *       USB island is POWERED DOWN. AHB power gate off, and the
+ *       LDO_USB33 that biases the PHY and the 1.5 k D+ pull-up is
+ *       down - no pull-up, no attach, and the host sees literally
+ *       nothing (not even an unknown device).
+ *
+ * THE FIX: replicate the OEM firmware's own UDC cold init. Recovered
+ * from the phone's flash.bin (XIP NOR dump, vaddr == file offset;
+ * UDC init at 0x29FFA, LDO helper at 0x29B04) and cross-checked
+ * against the leaked SC6531E/M Device Specification:
+ *
+ *   [0x20501080] = 0x10        AHB power-enable SET, bit 4 = USB
+ *                               island (DS 5.2.1: USB space lives on
+ *                               the AHB matrix at 0x90000000)
+ *   [0x8B000220] |= 0x20       GR module-control bit 5, set once and
+ *                               left set by the stock init
+ *   ...300 ms settle delay...   stock fw waits before touching UDC
+ *   [0x90000000] |= 2 then 1    SELF_PWR, then USB_EN (DS 6.1.4.2.1:
+ *                               "software should write 1 [to SELF_PWR]
+ *                               since our USB device is always
+ *                               self-powered")
+ *   arm EP0/EP2/EP3             max-packet 8/64/64, int enables,
+ *                               buffer-ready, EP-enable, TIMEOUT_LMT
+ *                               = IDENTICAL register writes to
+ *                               fpdoom's usb_init() (and to stock:
+ *                               0x29B2A/0x29B66/0x29BC6/0x29C0C/0x29C56)
+ *   LDO_USB_REG0.0 = 1 then 0   power-cycle: keep the host blind
+ *                               while re-arming, then power on. DS
+ *                               13.1.1.32: LDO_USB_REG0 lives on the
+ *                               analog die at Glb-reg offset 0x7C,
+ *                               ARM-side ADI window 0x82001400+, so
+ *                               its ARM address is 0x8200147C; bit 0
+ *                               LDO_USB_PD is "1: power down, 0:
+ *                               power on". Clearing it powers D+ ->
+ *                               the host sees the attach.
+ *
+ * The stock fw does the LDO power-down FIRST (soft-disconnect while
+ * reconfiguring) and powers on LAST - we keep that order but only
+ * on the truly-cold path: if USB_CTRL.USB_EN already reads 1 we are
+ * the FDL session's guest and must not disturb a live link (the
+ * AHB-power/GR writes are idempotent set/RMW ops, safe to repeat).
+ *
+ * ENUMERATION SERVICE: usbio.c only pumps interrupts from
+ * usb_read()/usb_getchar(). A host enumerating while the UI idles
+ * (menu, MIDlet event wait) would time out reading descriptors - so
+ * fpj_usb_pump() runs a 1-byte NON-blocking drain on every
+ * fp_sleep_ms() while the ring is empty (an empty-ring read steals
+ * nothing: usb_read() services EP0/EP2/EP3 interrupts, finds 0
+ * queued bytes and returns 0; if the host sent anything mid-pump it
+ * stays queued - never stolen, see the ring-guard).           */
+#define FPJ_AHB_USB_PWR   0x20501080u /* AHB power-en SET (SC6531E)  */
+#define FPJ_GR_USB_CTRL   0x8B000220u /* GR module control           */
+#define FPJ_USB_CTRL_REG  0x90000000u /* UDC USB_CTRL                */
+#define FPJ_ADI_LDO_USB   0x8200147Cu /* LDO_USB_REG0 (analog die)   */
+
+static int fpj_usb_up;   /* 0 = cold, 1 = up (brought up or adopted) */
+
+int fp_usb_init(void)
+{
+    if (fpj_usb_up) return 0;      /* idempotent                      */
+
+    /* USB island power + module control. The SET register and the
+     * RMW are idempotent, so these two are safe even when a live
+     * FDL session already owns the controller.                     */
+    MEM4(FPJ_AHB_USB_PWR) = 1u << 4;
+    MEM4(FPJ_GR_USB_CTRL) = MEM4(FPJ_GR_USB_CTRL) | (1u << 5);
+
+    /* island settle (the OEM UDC init waits 300 ms right here)     */
+    sys_wait_ms(300);
+
+    /* already armed? (LIBC_SDIO<3: entry.c ran usb_init() and the
+     * FDL host session is live) - adopt, touch nothing else.       */
+    if (MEM4(FPJ_USB_CTRL_REG) & 1u) {
+        fpj_usb_up = 1;
+        return 0;
+    }
+
+    /* cold: soft-disconnect (LDO off) while we (re)arm             */
+    adi_write(FPJ_ADI_LDO_USB, adi_read(FPJ_ADI_LDO_USB) | 1u);
+
+    /* controller: self-powered, then enable (stock order)          */
+    MEM4(FPJ_USB_CTRL_REG) = MEM4(FPJ_USB_CTRL_REG) | (1u << 1);
+    MEM4(FPJ_USB_CTRL_REG) = MEM4(FPJ_USB_CTRL_REG) | 1u;
+
+    /* arm EP0 (8) / EP2 OUT 0x02 (64) / EP3 IN 0x83 (64) + timeouts:
+     * fpdoom's own sequence, byte-for-byte the stock fw's, and the
+     * one already proven on this phone over the FDL link. Also
+     * zeroes the 2 KB RX ring.                                      */
+    usb_init();
+
+    /* LDO on: D+ pull-up powered -> the host sees 1782:4d00        */
+    adi_write(FPJ_ADI_LDO_USB, adi_read(FPJ_ADI_LDO_USB) & ~1u);
+
+    fpj_usb_up = 1;
+    return 0;
+}
+
+static void fpj_usb_pump(void)
+{
+    if (!fpj_usb_up) return;
+    if (fp_usb_available() != 0) return;  /* data pending: the reader
+                                           * owns the ring (a 1-byte
+                                           * drain could steal one) */
+    {
+        uint8_t t;
+        usb_read(&t, 1, USB_NOWAIT);     /* services EP0/EP2/EP3    */
+    }
+}

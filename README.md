@@ -61,16 +61,17 @@ metal), packaged as an **fpdoom app directory**:
 | 202-opcode CLDC interpreter | full JVM bytecode set incl. float/double (soft-float), computed-goto dispatch, exception tables, `<clinit>` |
 | Classfile parser | total (every read bounds-checked, every CP index validated), iterative — hierarchy depth cannot overflow the 36 KB app stack |
 | Mark & sweep GC | 1 MiB Java heap, 32k handles, iterative marking (1024-entry worklist) |
-| Native registry | 250+ methods: `java.lang`, `java.util`, `java.io`, `javax.microedition.{lcdui,game,rms,media,midlet}`, `com.nokia.mid` (Sound, DeviceControl, DirectGraphics) |
+| Native registry | 345 methods: `java.lang` (incl. full CLDC 1.1 wrapper boxing, `new String(bytes/chars)` ctors, **complete CLDC 1.1 `java.lang.Math`** and the standard exception stub ctors), `java.util`, `java.io`, `javax.microedition.{lcdui,game,rms,media,midlet}`, `com.nokia.mid` (Sound, DeviceControl, DirectGraphics) |
 | JAR reader | ZIP central-directory walker + tinfl inflate (vendored miniz 3.0.2) |
-| Image pipeline | stb_image 2.34 PNG decoder -> RGB565 blitter with all 8 `TRANS_*` constants |
+| 2D primitives | fillRect / drawRect / drawLine / fillTriangle / **drawArc / fillArc / drawRoundRect / clipRect** (pure-C trig shared with `Math.sin/cos/tan`), drawRegion with all 8 `TRANS_*`, drawRGB, drawString |
 | RMS | RecordStore on SD (log-structured flat files, per-jar suites) |
 | Launcher menu | on-phone jar picker (`fp_menu.c`): scans `games/fpj2me/*.jar`, lists, scrolls, launches, returns |
 | Portrait LCD scanout | native 128x160 portrait panel reprogramming + stock-fpdoom refresh flow |
-| Host test rig | 172 checks, runs on a PC with plain gcc — no phone, no ARM toolchain |
+| Image pipeline | stb_image 2.34 PNG decoder -> RGB565 blitter with all 8 `TRANS_*` constants |
+| Host test rig | 288 checks (286 unit + 2 stack-boot), runs on a PC with plain gcc — no phone, no ARM toolchain |
 
 ```
-~11,300 lines of C + vendored libs, zero fpdoom files modified.
+~10,300 lines of runtime C (+ vendored miniz/stb/font8x8), zero fpdoom files modified.
 ```
 
 ---
@@ -81,7 +82,7 @@ metal), packaged as an **fpdoom app directory**:
 - **Works on the phone** (itel it2163, SC6531E): upright native-portrait
   128x160 scanout, split-screen black bar gone, toroidal image wrap gone,
   D-pad upright (physical UP = Canvas UP).
-- **172/172 host checks pass** (170 unit + 2 boot-in-36KB-stack-thread
+- **288/288 host checks pass** (286 unit + 2 boot-in-36KB-stack-thread
   checks, `make check`).
 - **Refresh flow = stock fpdoom**: the GRAM window is programmed once at
   boot; every frame is `LCDC end-of-frame wait` + `sys_start_refresh()`.
@@ -339,7 +340,7 @@ make check          # = tests/run.sh
 
 `make check` needs gcc + python3 only. It regenerates the test jars,
 compiles the **whole runtime** natively against stubbed `fp_*` HAL
-primitives, and runs 172 checks (see [Testing](#testing)).
+primitives, and runs 288 checks (see [Testing](#testing)).
 
 ### 6.2 What the app Makefile does
 
@@ -684,7 +685,7 @@ The mapping the game sees (MIDP keycodes, de-facto Nokia/SE values all
 |   jar.c          ZIP central dir + tinfl (miniz)              |
 |   heap.c         objects, handles, mark&sweep GC, meta arena   |
 |   interp.c       classfile parser + 202-opcode interpreter     |
-|   natives.c      the native registry (250+ methods)           |
+|   natives.c      the native registry (345 methods)           |
 |   midp_image.c   PNG->RGB565 (stb_image, STBI_ONLY_PNG)       |
 |   midp_graphics.c drawImage/drawRegion (8 TRANS)/clip/fill     |
 |   midp_input.c   keypad -> MIDP keycodes, GameCanvas states   |
@@ -760,7 +761,9 @@ against stubbed `fp_*` primitives, and runs:
   36 KB stack** (stack overflow segfaults on the host instead of only
   freezing the phone).
 
-**STATUS: 172/172 PASS.**
+**STATUS: 311/311 unit PASS + 3/3 boot-stack PASS = 314/314**
+(288 pre-Round-10; +18 Round 10 UsbCast/GCF, +3 Round 11 cold-boot,
++5 Round 12 tight-loop bulk RX.)
 
 ### 12.2 `tests/boot_jar` — boot an arbitrary jar on the PC
 
@@ -906,6 +909,97 @@ Verified against the JSR-118 javadoc (details in `README.txt`):
 Full detail, root causes, and verification logs for every entry: see
 `README.txt`. Most recent first:
 
+- **(12) 2026-11-25 — USB bulk throughput: 0.2 → 12-20 fps.** The
+  Round 11 link enumerated and cast, but at 0.1-0.2 fps with
+  `usbcast: ACK timeout — resending` spam. Root cause: `usb_fill()`
+  (natives.c) slept `fp_sleep_ms(2)` after every partial bulk drain —
+  on the SC6531E that quantizes to a 10-16 ms timer tick, ×641
+  64-byte packets per 40,960-byte frame = >5 s/frame, a starved 2 KB
+  RX ring and host 5 s ACK timeouts mid-transfer. Fix: three-phase
+  fill loop — tight spin over `fp_usb_read()` (which IS
+  spin-poll `usb_check_int()` + drain-to-empty) while payload
+  streams, keypad/exit polling at a ~16 ms `fp_time_ms()` cadence,
+  and a yield ONLY before the first byte of a read (keeps Round 11's
+  EP0 service alive). Host side (`tools/usbcast_host.py`, user's
+  Round 11 edit preserved: `--kde`/`--portrait`/EBUSY-safe):
+  `queue max-size-buffers=1 leaky=downstream` before `videoconvert`
+  so GStreamer drops stale PipeWire frames while we wait on ACKs.
+  UsbCast.jar verified bulk-`read([BII)`+`drawPixels` (now pinned by
+  hostcheck). New drip-mode tests simulate the 64-byte wire cadence
+  (counterfactual: old code FAILS the no-sleep pin). run.sh jar
+  ordering fixed. 314/314 (311 unit + 3 boots), zero regressions.
+- **(11) 2026-11-25 — cold-boot USB enumeration**: sdboot/LIBC_SDIO=3
+  boots left the SC6531E UDC powered down (no AHB island power, no
+  LDO_USB → no D+ pull-up) AND `usb_init()` was compiled out, so
+  plugging the phone into Linux showed nothing in lsusb/dmesg.
+  `fp_usb_init()` (fp_platform.c) replays the OEM fw's own UDC cold
+  init — AHB power bit 4 (0x20501080), GR 0x8B000220 bit 5, 300 ms
+  settle, adopt-if-live check, LDO_USB_REG0 power cycle around
+  SELF_PWR/USB_EN + `usb_init()` — recovered from flash.bin
+  (0x29FFA/0x29B04) and cross-checked with the SC6531E datasheet.
+  `fp_sleep_ms()` now services EP0 (`fpj_usb_pump`, empty-ring
+  1-byte non-blocking drain) so a host enumerates while the UI
+  idles. Called once at boot (target_main.c) + lazily/idempotently
+  from `Connector.open("comm:usb")`. 309/309, zero regressions.
+- **(10) 2026-11-25 — USB screen casting: the phone as a live 128x160
+  Linux monitor (UsbCast.jar).** Inspected fpdoom's actual USB layer
+  first: `usbio.c` is compiled into our image and the bootloader
+  already enumerates the phone as a raw vendor-class device
+  (VID `0x1782`/PID `0x4D00`, class 0xFF, bulk EP OUT `0x02` / EP IN
+  `0x83`, 64-byte packets, 2 KB RX ring; with `LIBC_SDIO=3` nothing
+  else touches USB). Plumbed it as a 4-call HAL surface
+  (`platform.h` → `fp_platform.c`; LCD code untouched), mapped into
+  MIDP as `Connector.open("comm:usb")` → `StreamConnection` →
+  usb `InputStream`/`OutputStream` natives; `close()` aborts blocked
+  reads while they pump the frame pump, so the exit key ALWAYS breaks
+  a USB wait. Fast blit: `DirectGraphics.drawPixels(byte[], null, …,
+  TYPE_USHORT_565_RGB)` is now a native that does one memcpy per
+  clipped row (`gfx_draw_rgb565`) — zero per-pixel math, zero
+  per-frame allocation. Self-syncing frame protocol ("FPJ2" magic +
+  w/h/flags + LE-RGB565 payload; phone ACKs 'K' per frame, 'R' ready,
+  'Q' exit). `tools/make_usbcast_jar.py` hand-assembles the MIDlet;
+  `tools/usbcast_host.py` is the Linux sender (pyusb/libusb — no
+  /dev/ttyACM exists; `--demo`/`--stdin`/`--rotate`/`--fps`, KDE
+  Wayland pipewiresrc + ffmpeg one-liners, udev rule, numpy or
+  pure-Python encode). Tests: run33 GCF roundtrip incl. the
+  ConnectionNotFoundException path, C-level blit matrix (clip, bleed,
+  0x0000 fidelity), full `UsbCast.jar` boots through the real
+  `fpj2me_boot` with mock frames (wire == `RKKQ`, pixel-exact
+  fp_screen) and the RSOFT-while-blocked exit path (wire == `RKQ`) —
+  303/303, zero regressions.
+- **(9) 2026-11-25 — complete `java.lang.Math` + exception stubs (Wild
+  West Guns boot).** Launching `wwg.jar` froze at the boot diag
+  overlay on `m: java/lang/Math.max` — the `(JJ)J` overload was never
+  registered and degraded to a zero return. Registered the full
+  CLDC 1.1 Math set (max/min x4, abs x4 with NaN/±0.0/INT_MIN
+  semantics, sin/cos/tan/sqrt/ceil/floor/toRadians/toDegrees — pure
+  C, no libm, trig shared with the new arc rasterizer), `<init>` on
+  the ten standard exception classes, and — from a proactive
+  constant-pool scan of the jar — 17 more closures: `Integer.
+  byteValue`, `new String(char[],off,len)` (handle rebind),
+  `Thread.activeCount`, `Hashtable.remove`, Canvas/MIDlet
+  `<init>`, the Command/Displayable softkey path,
+  `Manager.createPlayer(InputStream,String)` and the four Graphics
+  primitives `clipRect` (intersect semantics) / `drawArc` /
+  `fillArc` (pie) / `drawRoundRect`. Tests: a bit-exact C-level Math
+  matrix, bytecode probes run25..run32 (incl. the first
+  exception-table test), arc/clipRect rasterization checks —
+  288/288.
+- **(8) 2026-11-25 — CLDC 1.1 / Java 5 wrapper boxing (AC2 sound-prompt
+  freeze).** AC2 booted to "DO YOU WANT SOUND?" but froze on SELECT:
+  the diag overlay's `m:` line read `java/lang/Integer.valueOf` (the
+  missing native degraded to a null return). Added the full wrapper
+  set — `valueOf(I/Z/J/B/S/C)` + `valueOf(String[,radix])`, `<init>`
+  constructors, `*Value()`, `toString()`, value-based `equals()`/
+  `hashCode()` for Integer/Boolean/Long/Byte/Short/Character, with
+  pinned Boolean TRUE/FALSE singletons, `Long.parseLong`, radix
+  `Integer.toString(v,r)`, `Byte.parseByte`, `StringBuffer.append(Z/
+  Object)`, and — via a new `heap.c handle_rebind()` primitive — real
+  `new String(byte[],off,len[,charset])` constructors (the GLLib text
+  path). A constant-pool scan of the real jar pinned every one of
+  these as AC2 call sites. The new tests also exposed a latent
+  `String.valueOf(int)` bug that dropped the last digit of every
+  formatted int.
 - **(7) 2026-11-25 — screen handled EXACTLY like stock fpdoom.** After
   (4)-(6) kept phase-shifting a toroidal wrap, the per-frame
   CASET/RASET/RAMWR re-pin was proven to *be* the bug (command bursts
@@ -957,7 +1051,232 @@ Vendored third-party code keeps its own licenses: `vendor/miniz.LICENSE`,
 
 ---
 
+<a name="usbcast"></a>
+## 21. USB screen casting (Round 10)
+
+`UsbCast.jar` turns the it2163 into a live 128x160 USB monitor for a
+Linux laptop. It boots from the launcher menu like any game jar.
+
+**Wire** — the phone is fpdoom's raw vendor-class USB device:
+VID `0x1782` / PID `0x4D00`, class 0xFF, bulk EP OUT `0x02`
+(phone RX) / EP IN `0x83` (phone TX). No kernel driver binds — the
+host script talks libusb directly (there is no `/dev/ttyACM*`).
+One-time udev rule (`/etc/udev/rules.d/51-fpj2me.rules`):
+
+    SUBSYSTEM=="usb", ATTRS{idVendor}=="1782", ATTRS{idProduct}=="4d00", MODE="0666"
+
+then `sudo udevadm control --reload-rules` and re-plug the phone
+(or just run the script with sudo).
+
+**Frame protocol** (self-syncing; the MIDlet re-scans for the magic
+after any desync, and USB NAK backpressure makes overflow
+impossible):
+
+    host→phone: "FPJ2" | u16le w=128 | u16le h=160 | u8 flags=0 | 40960 B LE-RGB565
+    phone→host: 'R' once at boot · 'K' after each DISPLAYED frame · 'Q' on exit
+
+**On the phone**: copy `UsbCast.jar` into the fpj2me folder on the SD
+card (next to `boot.jar` and the games), launch it from the menu,
+plug USB. The exit key (RSOFT, `-7`) always interrupts a waiting
+read and returns to the launcher.
+
+**On the laptop** (`tools/usbcast_host.py`; needs `python-pyusb` +
+`libusb`, numpy optional):
+
+    ./tools/usbcast_host.py --demo                              # link test
+    ffmpeg -i clip.mp4 -vf scale=128:160 -pix_fmt rgb24 -f rawvideo - \
+        | ./tools/usbcast_host.py --stdin                       # any video
+    gst-launch-1.0 pipewiresrc ! videoconvert ! videoscale \
+        ! video/x-raw,format=RGB,width=128,height=160 ! fdsink fd=1 \
+        | ./tools/usbcast_host.py --stdin                       # KDE Wayland
+    ffmpeg -f x11grab -video_size 1920x1080 -i :0 -vf scale=128:160 \
+        -pix_fmt rgb24 -f rawvideo - | ./tools/usbcast_host.py --stdin  # X11
+
+`--rotate cw|ccw` rotates a 160x128 landscape stream into the
+portrait panel; `--fps N` caps the rate (default: as fast as the
+phone ACKs — USB full-speed bulk gives ~12-20 fps at this frame
+size); `--selftest` validates the encoder/rotation without hardware.
+`--kde` (Round 11) opens the KDE Plasma Wayland ScreenCast portal
+picker via D-Bus and streams the picked window/monitor/virtual
+output directly — no ffmpeg, no manual gst-launch; pair it with
+`--portrait` to capture an upright 128x160 region without rotation
+(default is `--rotate cw` of the landscape capture). The script
+detaches any kernel driver that auto-bound, survives an EBUSY
+`set_configuration()` (another instance/re-plug leaves the config
+armed), and refuses to run twice against the same phone with a
+clear message.
+
+**Performance design**: the MIDlet does ZERO per-pixel math and ZERO
+per-frame allocation — one reused 40,978-byte buffer, bulk native
+reads (C memcpy), `DirectGraphics.drawPixels` → one memcpy per row
+into the RGB565 framebuffer, then repaint + `serviceRepaints()` and a
+1-byte ACK. Full fidelity: an exact `0x0000` black is displayed as
+black (no transparency remap).
+
+---
+
+<a name="round11"></a>
+## 22. Cold-boot USB enumeration (Round 11)
+
+**The bug**: `fpj2me.bin` cold-booted from microSD via sdboot and
+then plugged into Linux showed **nothing at all** in `lsusb`/
+`dmesg` — not even an unknown device. The Round 10 pipe worked only
+when the app had been loaded over USB by the Spreadtrum FDL host,
+because in THAT flow the Boot ROM/FDL1 leaves the USB device
+controller powered, clocked and armed. `usbio.c`'s "USB is already
+initialized by the bootloader" comment is true for `LIBC_SDIO<3`,
+and `entry.c` only calls `usb_init()` inside `#if LIBC_SDIO < 3` —
+with `LIBC_SDIO=3` (mandatory for sdboot SD-card apps) **nothing in
+the whole image ever touches USB**, and cold the SC6531E USB island
+is powered down anyway: AHB power gate off, and the `LDO_USB33`
+that biases the PHY **and the 1.5 k D+ pull-up** is off — no
+pull-up, no attach, invisible device.
+
+**The fix** — `fp_usb_init()` in `src/fp_platform.c`, a byte-faithful
+replay of the phone's OWN OEM firmware UDC cold init (recovered by
+static disassembly of the stock `flash.bin`, XIP NOR so vaddr ==
+file offset: UDC init at `0x29FFA`, LDO helper at `0x29B04`;
+cross-checked against the leaked SC6531E/M Device Specification):
+
+| step | write | meaning (evidence) |
+| --- | --- | --- |
+| 1 | `[0x20501080] = 0x10` | AHB power-enable SET register, **bit 4 = USB island** (DS §5.2.1: USB space 0x90000000–0x97FFFFFF is on the AHB matrix; stock fw writes 0x10 at flash 0x2A00A) |
+| 2 | `[0x8B000220] \|= 0x20` | GR module-control bit 5 — set once, left set by stock (flash 0x2A00E) |
+| 3 | `sys_wait_ms(300)` | island settle — stock fw delays 300 ms before touching the UDC (flash 0x2A020) |
+| 4 | adopt check | if `USB_CTRL.USB_EN` (0x90000000 bit 0) already reads 1, a live FDL session owns the controller → adopt untouched (the FDL path in `entry.c` ran `usb_init()`) |
+| 5 | LDO **off** | `LDO_USB_REG0` (analog die, Glb-reg offset 0x7C, ARM-side ADI window `0x8200147C`) bit 0 `LDO_USB_PD` = 1 — soft-disconnect while re-arming (DS §13.1.1.32: 1 = power down, 0 = power on) |
+| 6 | `USB_CTRL \|= 2, then \|= 1` | SELF_PWR then USB_EN (DS §6.1.4.2.1 — "software should write 1 [to SELF_PWR] since our USB device is always self-powered") |
+| 7 | `usb_init()` | fpdoom's EP arming — register-for-register IDENTICAL to the stock fw's (EP0 max-pkt 8 + buffer-ready, EP2 OUT 0x02 / EP3 IN 0x83 max-pkt 64 + EP-enable + per-EP int enables + `INT_CLR=0x3FFF`, `TIMEOUT_LMT`), and the sequence already proven on this phone over the FDL link; also zeroes the 2 KB RX ring |
+| 8 | LDO **on** | `LDO_USB_REG0` bit 0 = 0 — D+ pull-up powered → **the host sees the attach** and enumerates `1782:4d00` |
+
+**Enumeration service**: `usbio.c` only pumps EP0 control transfers
+from `usb_read()`/`usb_getchar()` — a host enumerating while the UI
+idles would time out reading descriptors. So `fp_sleep_ms()` now
+runs `fpj_usb_pump()` first: a 1-byte **non-blocking** drain while
+the RX ring is empty (services EP0/EP2/EP3 interrupts, steals
+nothing — pending bytes leave the pump alone and stay queued for
+the reader). That covers the launcher menu (`fp_sleep_ms(10)` per
+iteration), the MIDlet event wait (`fp_sleep_ms(20)`) and blocked
+`comm:usb` reads (they pump themselves via `fp_usb_read`).
+
+**Call sites**: once at boot in `target_main.c` (right after the
+banner + event drain — a plugged Linux host sees `1782:4d00`
+immediately, before any MIDlet runs), plus a lazy idempotent call
+in `nat_Connector_open("comm:usb")` so a harness that skips
+`target_main` still gets an armed pipe; on failure it degrades to
+the MIDP-mandated `ConnectionNotFoundException`.
+
+**Host tests** (`tests/hostcheck.c`, `usbcold:` block): the mock
+`fp_usb_init()` counts sequences actually executed vs. adopted —
+first `comm:usb` open runs the cold-init exactly once, a second
+open streams without re-running it (never reset endpoints under a
+live link), a forced failure throws `ConnectionNotFoundException`
+exactly, and the next open recovers. `tests/boot_jar.c` gets a
+permanent-success stub. 309/309 host checks pass (306 unit + 3
+stack boots), zero regressions.
+
+---
+
+<a name="round12"></a>
+## 23. USB bulk throughput: the tight-loop fix (Round 12)
+
+**The bug**: after Round 11 the link itself was perfect — cold-boot
+enumeration, the `'R'` handshake and KDE casting all worked — but a
+cast ran at **0.1-0.2 fps** and the host log spammed
+`usbcast: ACK timeout — resending` (frame counter jumping 2 → 3 →
+9 → 12 → 13 → 15). Three stacked causes:
+
+1. **Timer-tick stall in the bulk RX path** (the big one): a
+   40,969-byte frame is **641 64-byte bulk packets**, and
+   `usb_fill()` (natives.c) used to call `fp_sleep_ms(2)` after
+   EVERY partial drain. `fp_sleep_ms()` → `sys_wait_ms()` busy-waits
+   on the SC6531E hardware timer, and a 2 ms request quantizes to a
+   **full timer tick (~10-16 ms)** — across hundreds of ring refills
+   that is **>5 seconds per frame**, the 2048-byte `usb_buf` ring
+   starves, EP2 OUT NAKs endlessly, and the frame only crawls home.
+2. **Host ACK timeout → frame desync**: because a frame took >5 s,
+   `usbcast_host.py` hit its 5 s `ACK_TIMEOUT_MS` mid-transfer and
+   sent a NEW frame header into the middle of the old one, forcing
+   UsbCast.jar to burn CPU byte-scanning for the next `"FPJ2"` sync.
+3. **PipeWire queueing latency**: while `usbcast_host.py` blocks on
+   the phone's `'K'`, GStreamer's `pipewiresrc` happily queued STALE
+   desktop frames in front of `videoconvert`, so even a fast phone
+   would have displayed the past.
+
+**The phone fix** — `usb_fill()` is now a three-phase state machine
+(`src/natives.c`, shared verbatim with the host checks):
+
+- **ACTIVE RX (first byte seen, `rem > 0`)**: tight spin over
+  `fp_usb_read(dst+got, len-got)` — **no `fp_sleep_ms` at all** while
+  payload streams. Each call is already "spin-poll `usb_check_int()`
+  + `usb_read(p, rem, 0)`": fpdoom's `usb_read(…, USB_NOWAIT)`
+  services the UDC interrupt handler (EP0 enumeration included)
+  whenever the 2 KB ring has ≥ 64 bytes free, then drains the ring
+  to empty — so the ring never wedges full and the host never NAKs
+  longer than one loop pass (µs-scale on the 208 MHz ARM926).
+- **Keypad/exit polling** stays live at a **~16 ms cadence** gated by
+  `fp_time_ms()` (`FPJ_USB_KEY_POLL_MS`): a `midp_paint_pump()` plus
+  a re-check of the `close()` abort flag — the exit key still breaks
+  any blocked read (bounded latency ≈ one poll), without per-packet
+  pump overhead slowing the transfer.
+- **IDLE (before the first byte of a read)**: the only remaining
+  yield — pump events, then `fp_sleep_ms(2)`. That keeps Round 11's
+  EP0 enumeration service (`fpj_usb_pump` from the sleep path)
+  alive while no reader owns the ring, and it is the sanctioned
+  inter-frame gap wait.
+
+`fp_platform.c`'s `fp_usb_read()` keeps its signature and its
+single-drain semantics (one call = drain-to-empty + interrupt pump);
+the platform.h contract comment now pins that, and why the loop
+lives in natives.c (the host mock pipe is synchronous — a platform
+blocking primitive would be untestable there). Round 7 LCD pipeline
+and Round 11 `fp_usb_init()` untouched, byte-for-byte.
+
+**The host fix** — `tools/usbcast_host.py` (based on the user's own
+Round 11 edit, preserved: `--kde` portal mode, `--portrait`, the
+per-interface kernel-driver detach and the EBUSY-safe
+`set_configuration()`) inserts
+`queue max-size-buffers=1 leaky=downstream` between `pipewiresrc`
+and `videoconvert`: while we wait on the phone's ACK the queue drops
+the OLDER buffers and `fdsink` always emits the freshest frame. With
+the phone now ACKing a frame in ~40-50 ms (wire time for 641
+packets + blit), the 5 s timeout is never approached and the cast
+settles at the USB 1.1 full-speed ceiling: **~12-20 fps**.
+
+**UsbCast.jar verified** (Round 10 design held — now pinned by
+hostcheck): the payload always moves as **one bulk
+`InputStream.read(buf, 9, 40960)` into the pre-allocated 40,978-byte
+buffer** (never single-byte payload loops; only the 4-byte `"FPJ2"`
+header scan reads byte-wise), then one `DirectGraphics.drawPixels()`
+= one memcpy per row. Zero per-frame allocation.
+
+**Host tests** (`tests/hostcheck.c`): new **drip mode** feeds a
+40,969-byte frame 128 bytes per `fp_usb_read()` call, each call
+advancing the virtual clock 1 ms — a deterministic replay of the
+64-byte wire cadence. It pins: (1) `usb_bulk_reads == 2` — payload
+arrives as full-size `read([BII)` requests; (2)
+`usb_sleep_pending == 0` — **no `fp_sleep_ms` ever fires while RX
+payload is queued** (counterfactual-checked: reverting usb_fill to
+the Round 11 sleep-per-gap code FAILS exactly this check); (3) a
+RSOFT press armed mid-payload (drip call 64) aborts the bulk read
+through the ~16 ms keypad poll — `frames == 0`, wire `R Q`.
+`tests/run.sh` also gained a real fix: UsbCast.jar is now generated
+and copied to `/tmp/fpj2me/` BEFORE the hostcheck run (the old
+ordering left a fresh `/tmp` without the jar and 9 usbcast checks
+failed spuriously). **314/314** (311 unit + 3 stack boots), zero
+regressions.
+
+**On the phone**: nothing to reconfigure — rebuild
+`make LIBC_SDIO=3 CHIP=1 TOOLCHAIN=arm-…`, copy `fpj2me.bin` to the
+SD card, and the same `usbcast_host.py --kde` command now casts at
+full speed.
+
+---
+
 <a name="license"></a>
 ## 20. License
 
-GPLv3
+Your call — suggested **MIT** for the fpj2me code in this tree. Vendored
+files keep their own licenses (miniz MIT, stb MIT/PD, font8x8 PD). No
+fpdoom files are modified, so fpdoom's Unlicense applies only to the
+unmodified framework you build against.

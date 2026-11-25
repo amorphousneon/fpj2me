@@ -234,6 +234,17 @@ static const char *stub_super_of(const char *name)
           "java/lang/Exception" },
         { "javax/microedition/midlet/MIDletStateChangeException",
           "java/lang/Exception" },
+        /* Round 10 (UsbCast): the GCF class chain. Connector/
+         * StreamConnection are interface-ish stubs; the exception
+         * extends IOException per MIDP so catch(IOException) works. */
+        { "javax/microedition/io/Connector",
+          "java/lang/Object" },
+        { "javax/microedition/io/Connection",
+          "java/lang/Object" },
+        { "javax/microedition/io/StreamConnection",
+          "javax/microedition/io/Connection" },
+        { "javax/microedition/io/ConnectionNotFoundException",
+          "java/io/IOException" },
     };
     for (u32 i = 0; i < sizeof t / sizeof t[0]; i++)
         if (!strcmp(t[i].c, name)) return t[i].s;

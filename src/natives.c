@@ -423,6 +423,196 @@ static void nat_Class_getResourceAsStream(const Slot *a, int n, Slot *r)
     r[0].ref = s;
 }
 
+/* ---- javax.microedition.io "comm:usb" (Round 10: UsbCast) ------------
+ * fpdoom's usbio pipe (see platform.h) exposed as a MIDP stream:
+ *   Connector.open("comm:usb")              -> StreamConnection
+ *   sc.openInputStream()  -> java/io/InputStream  (slot 4 == 1)
+ *   sc.openOutputStream() -> java/io/OutputStream (slot 0 == 1)
+ * The InputStream carries an abort flag in slot 5: close() sets it
+ * and every blocked native read polls it, so the EXIT KEY always
+ * breaks a waiting read (UsbCast returns to the launcher; no hard
+ * lock, no battery pull). While waiting, reads pump the frame pump
+ * every ~2 ms — keypad events and repaints keep flowing exactly
+ * like the SD-read io pump (fpj_io_pump) that Round 8 verified on
+ * hardware. USB semantics of the stream (documented deviation):
+ * read() blocks until data, close(), or link-EOF; -1 is returned
+ * ONLY for close()/EOF, never as an idle timeout, so the MIDlet's
+ * readFully-style loops never mistake a slow host for a dead one. */
+#define USB_IN_MODE(o)  (SLOT((o), 4) == 1)
+#define USB_OUT_MODE(o) (SLOT((o), 0) == 1)
+
+/* fill exactly len bytes; 1 = complete, 0 = aborted (close/EOF)
+ *
+ * Round 12 — TIGHT-LOOP BULK RX (the 0.2 fps fix). A 40,960-byte
+ * frame is 641 64-byte bulk packets; the old loop slept 2 ms after
+ * every partial drain, and fp_sleep_ms(2) -> sys_wait_ms(2) on the
+ * SC6531E quantizes to a full hardware-timer tick (~10-16 ms), so
+ * hundreds of refills of the 2048-byte usb_buf ring cost >5 s per
+ * frame, starved EP2 (endless NAK) and tripped the host's 5 s ACK
+ * timeout mid-transfer. The fill is now a three-phase state machine:
+ *
+ *   ACTIVE (first byte seen, rem > 0): spin fp_usb_read() in a
+ *     tight loop with NO sleep. Each call IS "spin-poll
+ *     usb_check_int() + usb_read(p, rem, 0)": fpdoom's usb_read()
+ *     pumps the UDC interrupt handler (EP0 enumeration included)
+ *     whenever the ring has >= 64 bytes free, then drains the ring
+ *     to empty before returning - so the ring never overflows and
+ *     the host never NAKs longer than one loop pass.
+ *   Keypad/abort polling stays LIVE at ~16 ms cadence (fp_time_ms):
+ *     midp_paint_pump() + a close()-flag recheck every 16 ms of
+ *     streaming — the exit key still breaks any read, without
+ *     per-packet pump overhead slowing the bulk transfer.
+ *   IDLE (not one byte of this read yet): the ONLY place we still
+ *     yield — pump events, then fp_sleep_ms(2). That is the
+ *     sanctioned pre-first-byte wait, and it keeps Round 11's EP0
+ *     enumeration service (fpj_usb_pump runs from fp_sleep_ms)
+ *     alive while no MIDlet reader owns the ring.                    */
+#define FPJ_USB_KEY_POLL_MS 16u
+
+static int usb_fill(JObj *o, u8 *dst, u32 len)
+{
+    u32 got = 0;
+    u32 last_poll = 0;                     /* 0 = poll on first gap */
+    while (got < len) {
+        if (SLOT(o, 5)) return 0;          /* close() abort        */
+        int k = fp_usb_read(dst + got, len - got);
+        if (k < 0) return 0;               /* link gone (host)     */
+        got += (u32)k;
+        if (got >= len) break;             /* complete             */
+
+        if (got == 0) {
+            /* IDLE: no first byte yet — keys + repaints + the EP0
+             * enumeration service, then yield the wire wait       */
+            midp_paint_pump();
+            fp_sleep_ms(2);
+            continue;
+        }
+
+        /* ACTIVE: tight spin, no sleep. Keypad/exit poll at ~16 ms
+         * so a blocked bulk read still aborts on the exit key     */
+        u32 now = fp_time_ms();
+        if (last_poll == 0 || (u32)(now - last_poll) >= FPJ_USB_KEY_POLL_MS) {
+            last_poll = now;
+            midp_paint_pump();
+            if (SLOT(o, 5)) return 0;      /* key press -> close() */
+        }
+    }
+    return 1;
+}
+
+/* Connector.open(String): "comm:usb" (optionally "comm:usb;...") is
+ * the live USB pipe; anything else throws the MIDP-mandated
+ * ConnectionNotFoundException (a stub class — Round 9 machinery). */
+static void nat_Connector_open(const Slot *a, int n, Slot *r)
+{
+    (void)n;
+    r[0].ref = 0;
+    char url[64];
+    if (!AR(a, 0)) {
+        fpj_throw(fpj_new_exception("java/lang/NullPointerException", 0));
+        return;
+    }
+    str_to_c(AR(a, 0), url, sizeof url);
+    if (!strncmp(url, "comm:usb", 8) && (url[8] == 0 || url[8] == ';')) {
+        /* Round 11: lazy cold-init (idempotent): boot already brought
+         * the controller up, but if this MIDlet runs under a harness
+         * that skipped target_main's call, the first open still arms
+         * the pipe instead of hanging on a dead controller. Failure
+         * (mock-only on host) degrades to the MIDP exception.      */
+        if (fp_usb_init() != 0) {
+            fpj_throw(fpj_new_exception(
+                "javax/microedition/io/ConnectionNotFoundException", 0));
+            return;
+        }
+        JRef c = native_new("javax/microedition/io/StreamConnection", 2);
+        JObj *o = obj(c);
+        if (o) SLOT(o, 0) = 1;             /* live USB connection    */
+        r[0].ref = c;
+    } else {
+        fpj_throw(fpj_new_exception(
+            "javax/microedition/io/ConnectionNotFoundException", 0));
+    }
+}
+
+static void nat_SC_openInputStream(const Slot *a, int n, Slot *r)
+{
+    (void)a; (void)n;
+    JRef s = native_new("java/io/InputStream", 6);
+    JObj *o = obj(s);
+    if (o) SLOT(o, 4) = 1;                 /* usb mode (slot5 abort) */
+    r[0].ref = s;
+}
+
+static void nat_SC_openOutputStream(const Slot *a, int n, Slot *r)
+{
+    (void)a; (void)n;
+    JRef s = native_new("java/io/OutputStream", 2);
+    JObj *o = obj(s);
+    if (o) SLOT(o, 0) = 1;                 /* usb mode               */
+    r[0].ref = s;
+}
+
+static void nat_SC_close(const Slot *a, int n, Slot *r)
+{ (void)a; (void)n; (void)r; }            /* pipe is shareable       */
+
+/* Connector.openInputStream/openOutputStream convenience forms       */
+static void nat_Connector_openInputStream(const Slot *a, int n, Slot *r)
+{
+    Slot c[1] = {{0}};
+    nat_Connector_open(a, 1, c);
+    if (fpj_pending_exc || !c[0].ref) { r[0].ref = 0; return; }
+    nat_SC_openInputStream(c, 1, r);
+}
+
+static void nat_Connector_openOutputStream(const Slot *a, int n, Slot *r)
+{
+    Slot c[1] = {{0}};
+    nat_Connector_open(a, 1, c);
+    if (fpj_pending_exc || !c[0].ref) { r[0].ref = 0; return; }
+    nat_SC_openOutputStream(c, 1, r);
+}
+
+static void nat_Connector_close(const Slot *a, int n, Slot *r)
+{ (void)a; (void)n; (void)r; }
+
+/* ---- java.io.OutputStream: the comm:usb TX side -------------------- */
+static void nat_OutputStream_write_I(const Slot *a, int n, Slot *r)
+{
+    (void)n; (void)r;
+    JObj *t = THISO(a);
+    if (!t) return;
+    if (USB_OUT_MODE(t)) {
+        u8 b = (u8)AI(a, 1);
+        fp_usb_write(&b, 1);              /* UsbCast's 1-byte ACK     */
+    }
+    /* any other OutputStream sink: silent no-op (degrade policy)     */
+}
+
+static void nat_OutputStream_write_bulk(const Slot *a, int n, Slot *r)
+{
+    (void)n; (void)r;
+    JObj *t = THISO(a), *arr = obj(AR(a, 1));
+    if (!t || !arr) {
+        fpj_throw(fpj_new_exception("java/lang/NullPointerException", 0));
+        return;
+    }
+    s32 off, cnt;
+    if (n >= 4) { off = AI(a, 2); cnt = AI(a, 3); }   /* write([BII)  */
+    else        { off = 0;     cnt = (s32)ARR_LEN(arr); }
+    if (off < 0 || cnt < 0 || (u32)(off + cnt) > ARR_LEN(arr)) {
+        fpj_throw(fpj_new_exception("java/lang/IndexOutOfBoundsException", 0));
+        return;
+    }
+    if (USB_OUT_MODE(t) && cnt)
+        fp_usb_write(ARR_DATA(arr) + off, (u32)cnt);
+}
+
+static void nat_OutputStream_flush(const Slot *a, int n, Slot *r)
+{ (void)a; (void)n; (void)r; }   /* usb writes are synchronous anyway */
+
+static void nat_OutputStream_close(const Slot *a, int n, Slot *r)
+{ (void)a; (void)n; (void)r; }
+
 /* ---- java.io.InputStream over the captured entry buffer ------------ */
 static u8 *stream_buf_of(JObj *o)          { return (u8 *)GET_PTR(o, 0); }
 
@@ -432,6 +622,11 @@ static void nat_InputStream_read(const Slot *a, int n, Slot *r)
     r[0].w = -1;                           /* EOF / closed / null      */
     JObj *o = THISO(a);
     if (!o) return;
+    if (USB_IN_MODE(o)) {                  /* comm:usb: block, pump,  */
+        u8 b;                              /* abort on close()/EOF    */
+        if (usb_fill(o, &b, 1)) r[0].w = b;
+        return;
+    }
     u8 *buf = stream_buf_of(o);
     u32 pos = SLOT(o, 2), len = SLOT(o, 3);
     if (!buf || pos >= len) return;
@@ -457,6 +652,12 @@ static void nat_InputStream_read_bulk(const Slot *a, int n, Slot *r)
         return;
     }
     if (cnt == 0) { r[0].w = 0; return; }  /* len==0: 0 even at EOF   */
+    if (USB_IN_MODE(o)) {
+        /* comm:usb: fill the WHOLE request or report abort as -1;
+         * partial data is never lost (the loop keeps what it got)   */
+        if (usb_fill(o, ARR_DATA(dst) + off, (u32)cnt)) r[0].w = cnt;
+        return;
+    }
     u8 *buf = stream_buf_of(o);
     u32 pos = SLOT(o, 2), len = SLOT(o, 3);
     if (!buf || pos >= len) return;         /* EOF: -1                 */
@@ -477,6 +678,7 @@ static void nat_InputStream_available(const Slot *a, int n, Slot *r)
     r[0].w = 0;
     JObj *o = THISO(a);
     if (!o) return;
+    if (USB_IN_MODE(o)) { r[0].w = (s32)fp_usb_available(); return; }
     u32 pos = SLOT(o, 2), len = SLOT(o, 3);
     r[0].w = (pos < len) ? (s32)(len - pos) : 0;
 }
@@ -486,6 +688,10 @@ static void nat_InputStream_close(const Slot *a, int n, Slot *r)
     (void)n; (void)r;
     JObj *o = THISO(a);
     if (!o) return;
+    if (USB_IN_MODE(o)) {
+        SLOT(o, 5) = 1;                   /* abort any blocked read   */
+        return;
+    }
     u8 *buf = stream_buf_of(o);
     if (buf) { stream_untrack(buf); fp_free(buf); }
     SET_PTR(o, 0, 0);
@@ -499,6 +705,18 @@ static void nat_InputStream_skip(const Slot *a, int n, Slot *r)
     JObj *o = THISO(a);
     if (!o) return;
     s64 want = (s64)((u64)a[1].w | (u64)a[2].w << 32);
+    if (USB_IN_MODE(o)) {                 /* read & discard in chunks  */
+        u8 tmp[64];
+        s64 did = 0;
+        while (did < want) {
+            u32 k = (u64)(want - did) > sizeof tmp ? sizeof tmp
+                                                 : (u32)(want - did);
+            if (!usb_fill(o, tmp, k)) break;
+            did += k;
+        }
+        r[0].w = (u32)(u64)did; r[1].w = (u32)((u64)did >> 32);
+        return;
+    }
     u32 pos = SLOT(o, 2), len = SLOT(o, 3);
     s64 avail = (pos < len) ? (s64)(len - pos) : 0;
     s64 k = want < avail ? want : avail;
@@ -1073,7 +1291,11 @@ static void nat_String_valueOf_I(const Slot *a, int n, Slot *r)
     u32 u = neg ? (u32)(-v) : (u32)v;
     do { buf[--p] = (char)('0' + u % 10); u /= 10; } while (u);
     if (neg) buf[--p] = '-';
-    buf[15] = 0;
+    /* NO "buf[15] = 0" here: position 15 is ALWAYS the last digit
+     * (the do/while writes it for every value incl. 0), so that line
+     * clobbered the final character of every formatted int —
+     * String.valueOf(5) came back "" and -200 printed as "-20".
+     * out[] is NUL-terminated below, exactly like the (J) variant.  */
     char out[17]; int i = 0;
     while (p < 16) out[i++] = buf[p++];
     out[i] = 0;
@@ -1093,6 +1315,91 @@ static void nat_String_valueOf_J(const Slot *a, int n, Slot *r)
     while (p < 24 && i < 24) out[i++] = buf[p++];
     out[i] = 0;
     r[0].ref = mkstr(out);
+}
+
+/* ---- java.lang.String constructors --------------------------------
+ * 'new String(...)' from bytecode: the 'new' opcode allocates a
+ * placeholder T_OBJECT for the java/lang/String stub class, but a
+ * real String in this VM is a T_ARR_C char array (clazz 0). The
+ * constructor builds the real array and handle_rebind() (heap.c)
+ * moves the CALLER's reference onto it; the placeholder block turns
+ * into ordinary garbage. The receiver is pinned across the internal
+ * allocation — the invoke already popped it off the operand stack
+ * into a C local the mark phase cannot see. AC2's GLLib builds
+ * every text/IGP string through new String(bytes, off, len[, enc]):
+ * before these, the ctor degraded to a no-op and left a hollow
+ * T_OBJECT behind (length 0 / empty text everywhere).           */
+static void string_ctor_bind(JRef self, JRef s)
+{
+    if (s) handle_rebind(self, s);
+}
+
+static void nat_String_init_empty(const Slot *a, int n, Slot *r)
+{
+    (void)n; (void)r;
+    gc_pin(a[0].ref);                  /* survive an alloc-triggered GC  */
+    JRef s = str_from_utf8("", 0);
+    string_ctor_bind(a[0].ref, s);
+    gc_unpin(1);
+}
+
+static void nat_String_init_copy(const Slot *a, int n, Slot *r)
+{   /* String(String): real copy — sharing via rebind would retire the
+     * source handle, and interned literals are shared by design      */
+    (void)n; (void)r;
+    JObj *src = obj(AR(a, 1));
+    if (!src || src->type != T_ARR_C) { nat_String_init_empty(a, n, r); return; }
+    gc_pin(a[0].ref);
+    JRef s = ref_alloc(T_ARR_C, 4 + 2 * slen(src), 0);
+    JObj *d = obj(s);
+    if (d) { ARR_LEN(d) = slen(src); memcpy(schars(d), schars(src), slen(src) * 2); }
+    string_ctor_bind(a[0].ref, s);
+    gc_unpin(1);
+}
+
+static void nat_String_init_bytes(const Slot *a, int n, Slot *r)
+{   /* String(byte[], off, len): bytes are UTF-8 (utf8_dec falls back
+     * to Latin-1 per byte on malformed sequences) — the GLLib text
+     * format. The 4-arg (charset) form arrives here too: MIDP games
+     * pass "UTF-8" and behave identically, so the name is ignored.  */
+    (void)n; (void)r;
+    JObj *b = obj(AR(a, 1));
+    s32 off = AI(a, 2), len = AI(a, 3);
+    if (!b || b->type != T_ARR_B) { nat_String_init_empty(a, n, r); return; }
+    if (off < 0 || len < 0 || (u32)off + (u32)len > ARR_LEN(b)) {
+        fpj_throw(fpj_new_exception("java/lang/StringIndexOutOfBoundsException",
+                                    "new String"));
+        return;
+    }
+    gc_pin(a[0].ref);
+    JRef s = str_from_utf8((const char *)ARR_DATA(b) + off, (u32)len);
+    string_ctor_bind(a[0].ref, s);
+    gc_unpin(1);
+}
+
+static void nat_String_init_chars(const Slot *a, int n, Slot *r)
+{   /* String(char[], off, len) — same handle-rebind flow as the byte[]
+     * ctor, but the source is already UTF-16 (WWG builds strings from
+     * decoded char arrays). Bounds follow Java:
+     * StringIndexOutOfBoundsException, not a silent empty string.     */
+    (void)n; (void)r;
+    JObj *b = obj(AR(a, 1));
+    s32 off = AI(a, 2), len = AI(a, 3);
+    if (!b || b->type != T_ARR_C) { nat_String_init_empty(a, n, r); return; }
+    if (off < 0 || len < 0 || (u32)off + (u32)len > ARR_LEN(b)) {
+        fpj_throw(fpj_new_exception("java/lang/StringIndexOutOfBoundsException",
+                                    "new String"));
+        return;
+    }
+    gc_pin(a[0].ref);
+    JRef s = ref_alloc(T_ARR_C, 4 + 2 * (u32)len, 0);
+    JObj *d = obj(s);
+    if (d) {
+        ARR_LEN(d) = (u32)len;
+        memcpy(schars(d), ((u16 *)ARR_DATA(b)) + off, (size_t)len * 2);
+    }
+    string_ctor_bind(a[0].ref, s);
+    gc_unpin(1);
 }
 
 static void nat_String_indexOf(const Slot *a, int n, Slot *r)
@@ -1343,6 +1650,60 @@ static void nat_SB_append_J(const Slot *a, int n, Slot *r)
     if (t && s) sb_append(t, schars(s), slen(s));
     r[0].ref = a[0].ref;
 }
+
+static void nat_SB_append_Z(const Slot *a, int n, Slot *r)
+{
+    (void)n;
+    JObj *t = THISO(a);
+    static const u16 ts[] = { 't','r','u','e' };
+    static const u16 fs[] = { 'f','a','l','s','e' };
+    if (t) sb_append(t, AI(a, 1) ? ts : fs, AI(a, 1) ? 4 : 5);
+    r[0].ref = a[0].ref;
+}
+
+static void nat_SB_append_O(const Slot *a, int n, Slot *r)
+{   /* append(Object): J2SE appends String.valueOf(obj) — "null" for a
+     * null, the object's own toString() otherwise. Wrappers hit their
+     * native toString; anything unmodeled falls back to the Object
+     * "Cls@HEX" form so the buffer at least keeps a readable token.
+     * The receiver and the source string stay pinned across
+     * sb_append's buffer-growth allocation (the invoke already popped
+     * both off the operand stack into C locals).                    */
+    (void)n;
+    JRef self = a[0].ref, arg = AR(a, 1);
+    JObj *t = obj(self), *ao = obj(arg);
+    if (t) {
+        gc_pin(self);
+        if (!ao) {
+            static const u16 nul[] = { 'n','u','l','l' };
+            sb_append(t, nul, 4);
+        } else if (ao->type == T_ARR_C) {         /* a String          */
+            gc_pin(arg);
+            sb_append(t, schars(ao), slen(ao));
+            gc_unpin(1);
+        } else {
+            const NativeEntry *tn = 0;
+            if (ao->clazz)
+                tn = native_lookup(((JClass *)ao->clazz)->name,
+                                   "toString", "()Ljava/lang/String;");
+            Slot nb[1], nr[2] = { {0}, {0} };
+            nb[0].ref = arg;
+            gc_pin(arg);                     /* fn may allocate        */
+            if (tn) tn->fn(nb, 1, nr);
+            else    nat_Object_toString(nb, 1, nr);
+            gc_unpin(1);
+            JRef sref = nr[0].ref;
+            JObj *so = obj(sref);
+            if (so && so->type == T_ARR_C) {
+                gc_pin(sref);
+                sb_append(t, schars(so), slen(so));
+                gc_unpin(1);
+            }
+        }
+        gc_unpin(1);
+    }
+    r[0].ref = self;
+}
 static void nat_SB_toString(const Slot *a, int n, Slot *r)
 {
     (void)n;
@@ -1372,8 +1733,21 @@ static void nat_SB_setLength(const Slot *a, int n, Slot *r)
   if (t) { u32 l = (u32)AI(a, 1); if (l <= SLOT(t, 1)) SLOT(t, 1) = l; } }
 
 /* ------------------------------------------------------------------ */
-/* java.lang.Math                                                       */
+/* java.lang.Math  —  the COMPLETE CLDC 1.1 set (Round 9)               */
 /* ------------------------------------------------------------------ */
+/* NO libm anywhere: fpdoom links -nostdlib + -lgcc, and sin/cos/tan/
+ * sqrt/ceil/floor are NOT in libgcc, so everything below is pure C
+ * (libgcc supplies only the __aeabi_d* soft-float arithmetic the
+ * compiler already emits for every other double opcode — no Makefile
+ * change, no -lm). NaN / ±0.0 semantics follow CLDC 1.1 (JLS):
+ *   max/min : NaN wins; max(+0.0,-0.0)=+0.0, min(+0.0,-0.0)=-0.0
+ *   abs     : |NaN|=NaN (sign bit cleared), |-0.0|=+0.0
+ *   sin/cos : NaN and ±Inf -> NaN; sin(±0)=±0
+ *   sqrt    : x<0 -> NaN, sqrt(±0)=±0, sqrt(Inf)=Inf
+ *   ceil/floor : NaN->NaN, ±Inf->±Inf, integral/±0 unchanged
+ * (WWG froze its boot diag on "m: java/lang/Math.max": the (JJ)J
+ * overload was not registered and degraded to the zero-returning
+ * no-op fallback — the exact hole this closes.)                     */
 static float sf(const Slot *a, int i)
 { float f; u32 w = a[i].w; memcpy(&f, &w, 4); return f; }
 static double sd(const Slot *a, int i)
@@ -1384,34 +1758,166 @@ static void putf(Slot *r, float f)
 static void putd(Slot *r, double d)
 { u64 u; memcpy(&u, &d, 8); r[0].w = (u32)u; r[1].w = (u32)(u >> 32); }
 
+static double dnan(void)                  /* the canonical quiet NaN   */
+{ u64 u = 0x7FF8000000000000ULL; double d; memcpy(&d, &u, 8); return d; }
+static double d_inf(int neg)
+{ u64 u = neg ? 0xFFF0000000000000ULL : 0x7FF0000000000000ULL;
+  double d; memcpy(&d, &u, 8); return d; }
+
+/* (J) helpers: the two-slot lo/hi marshaling used by the interpreter */
+static s64 slot_j(const Slot *a, int i)
+{ return (s64)((u64)a[i].w | (u64)a[i+1].w << 32); }
+static void putj(Slot *r, s64 v)
+{ r[0].w = (u32)(u64)v; r[1].w = (u32)((u64)v >> 32); }
+
+/* IEEE bit helpers (no math.h signbit: target is -nostdlib)         */
+static u32 fbits(float f)  { u32 w; memcpy(&w, &f, 4);  return w; }
+static u64 dbits(double d) { u64 u; memcpy(&u, &d, 8);  return u; }
+
+static float jmax_f(float x, float y)
+{
+    if (x != x) return x;                 /* NaN wins                  */
+    if (y != y) return y;
+    if (x == y && x == 0.0f)              /* ±0 pair: +0 wins for max  */
+        return (fbits(x) & 0x80000000u) ? y : x;
+    return (x > y) ? x : y;
+}
+static float jmin_f(float x, float y)
+{
+    if (x != x) return x;
+    if (y != y) return y;
+    if (x == y && x == 0.0f)              /* ±0 pair: -0 wins for min  */
+        return (fbits(x) & 0x80000000u) ? x : y;
+    return (x < y) ? x : y;
+}
+static double jmax_d(double x, double y)
+{
+    if (x != x) return x;
+    if (y != y) return y;
+    if (x == y && x == 0.0)
+        return (dbits(x) >> 63) ? y : x;
+    return (x > y) ? x : y;
+}
+static double jmin_d(double x, double y)
+{
+    if (x != x) return x;
+    if (y != y) return y;
+    if (x == y && x == 0.0)
+        return (dbits(x) >> 63) ? x : y;
+    return (x < y) ? x : y;
+}
+
 static void nat_Math_abs_I(const Slot *a, int n, Slot *r)
-{ (void)n; s32 v = AI(a, 0); r[0].w = (v < 0) ? (u32)(-(s64)v) : (u32)v; }
+{ (void)n; s32 v = AI(a, 0);
+  /* abs(INT_MIN) = INT_MIN (JLS): the widening negation wraps back   */
+  r[0].w = (v < 0) ? (u32)(-(s64)v) : (u32)v; }
+static void nat_Math_abs_J(const Slot *a, int n, Slot *r)
+{ (void)n; s64 v = slot_j(a, 0);
+  /* abs(LONG_MIN) = LONG_MIN (JLS): two's-complement wrap           */
+  putj(r, (v < 0) ? -v : v); }
 static void nat_Math_abs_F(const Slot *a, int n, Slot *r)
-{ (void)n; putf(r, sf(a, 0) < 0 ? -sf(a, 0) : sf(a, 0)); }
+{ (void)n; r[0].w = a[0].w & 0x7FFFFFFFu; }          /* clear sign bit */
 static void nat_Math_abs_D(const Slot *a, int n, Slot *r)
-{ (void)n; putd(r, sd(a, 0) < 0 ? -sd(a, 0) : sd(a, 0)); }
+{ (void)n; r[0].w = a[0].w;
+  r[1].w = a[1].w & 0x7FFFFFFFu; }                   /* sign in hi word */
+
 static void nat_Math_max_I(const Slot *a, int n, Slot *r)
 { (void)n; r[0].w = AI(a, 0) > AI(a, 1) ? a[0].w : a[1].w; }
 static void nat_Math_min_I(const Slot *a, int n, Slot *r)
 { (void)n; r[0].w = AI(a, 0) < AI(a, 1) ? a[0].w : a[1].w; }
+static void nat_Math_max_J(const Slot *a, int n, Slot *r)
+{ (void)n; putj(r, slot_j(a, 0) > slot_j(a, 2) ? slot_j(a, 0)
+                                              : slot_j(a, 2)); }
+static void nat_Math_min_J(const Slot *a, int n, Slot *r)
+{ (void)n; putj(r, slot_j(a, 0) < slot_j(a, 2) ? slot_j(a, 0)
+                                              : slot_j(a, 2)); }
 static void nat_Math_max_F(const Slot *a, int n, Slot *r)
-{ (void)n; putf(r, sf(a, 0) > sf(a, 1) ? sf(a, 0) : sf(a, 1)); }
+{ (void)n; putf(r, jmax_f(sf(a, 0), sf(a, 1))); }
 static void nat_Math_min_F(const Slot *a, int n, Slot *r)
-{ (void)n; putf(r, sf(a, 0) < sf(a, 1) ? sf(a, 0) : sf(a, 1)); }
+{ (void)n; putf(r, jmin_f(sf(a, 0), sf(a, 1))); }
 static void nat_Math_max_D(const Slot *a, int n, Slot *r)
-{ (void)n; putd(r, sd(a, 0) > sd(a, 1) ? sd(a, 0) : sd(a, 1)); }
+{ (void)n; putd(r, jmax_d(sd(a, 0), sd(a, 2))); }
 static void nat_Math_min_D(const Slot *a, int n, Slot *r)
-{ (void)n; putd(r, sd(a, 0) < sd(a, 1) ? sd(a, 0) : sd(a, 1)); }
+{ (void)n; putd(r, jmin_d(sd(a, 0), sd(a, 2))); }
+
+/* ---- trigonometry: the kernels live in midp_graphics.c (gfx_sincos)
+ * — ONE implementation shared with the arc rasterizer. Same rules:
+ * NaN in -> NaN out, ±Inf -> NaN, sin(±0) = ±0.                     */
+static void nat_Math_sin(const Slot *a, int n, Slot *r)
+{
+    (void)n;
+    double x = sd(a, 0), s, c;
+    if (x != x) { putd(r, x); return; }             /* NaN            */
+    if (x - x != 0.0) { putd(r, dnan()); return; }  /* ±Inf -> NaN    */
+    gfx_sincos(x, &s, &c);
+    putd(r, s);
+}
+static void nat_Math_cos(const Slot *a, int n, Slot *r)
+{
+    (void)n;
+    double x = sd(a, 0), s, c;
+    if (x != x) { putd(r, x); return; }
+    if (x - x != 0.0) { putd(r, dnan()); return; }
+    gfx_sincos(x, &s, &c);
+    putd(r, c);
+}
+static void nat_Math_tan(const Slot *a, int n, Slot *r)
+{
+    (void)n;
+    double x = sd(a, 0), s, c;
+    if (x != x) { putd(r, x); return; }
+    if (x - x != 0.0) { putd(r, dnan()); return; }
+    gfx_sincos(x, &s, &c);
+    if (c == 0.0) { putd(r, d_inf(s < 0)); return; }  /* the pole     */
+    putd(r, s / c);
+}
 static void nat_Math_sqrt(const Slot *a, int n, Slot *r)
 {
     (void)n;
     double x = sd(a, 0);
-    if (x < 0) { putd(r, 0.0); return; }
-    if (x == 0) { putd(r, 0.0); return; }
+    if (x != x) { putd(r, x); return; }             /* NaN in, NaN out*/
+    if (x < 0)   { putd(r, dnan()); return; }       /* Java: NaN      */
+    if (x == 0)  { putd(r, x); return; }            /* ±0 -> ±0 (JLS) */
+    if (x - x != 0.0) { putd(r, x); return; }       /* +Inf -> +Inf   */
     double g = x > 1 ? x : 1;
     for (int i = 0; i < 40; i++) g = (g + x / g) * 0.5;
+    /* AM-GM holds in REAL arithmetic only: rounding can land the
+     * iterate a hair UNDER the root (sqrt(16) -> 3.9999999999999996)
+     * and d2i would truncate to 3. Nudge one ulp while g*g < x.     */
+    if (g > 0 && g * g < x) {
+        u64 u = dbits(g) + 1;
+        memcpy(&g, &u, 8);
+    }
     putd(r, g);
 }
+static double jfloor(double x)
+{
+    if (x != x || x == 0.0 || x - x != 0.0) return x;  /* NaN/±0/±Inf */
+    if (x < -9.0e18 || x > 9.0e18) return x;      /* |x| integral in dbl */
+    s64 i = (s64)x;                               /* trunc toward zero */
+    if (x < 0 && (double)i != x) i--;
+    return (double)i;
+}
+static double jceil(double x)
+{
+    if (x != x || x == 0.0 || x - x != 0.0) return x;
+    if (x < -9.0e18 || x > 9.0e18) return x;
+    if (x > -1.0 && x < 0.0) {           /* JLS: ceil(-0.5) = -0.0     */
+        u64 u = 0x8000000000000000ULL;
+        double d; memcpy(&d, &u, 8); return d;
+    }
+    s64 i = (s64)x;
+    if (x > 0 && (double)i != x) i++;
+    return (double)i;
+}
+static void nat_Math_ceil(const Slot *a, int n, Slot *r)
+{ (void)n; putd(r, jceil(sd(a, 0))); }
+static void nat_Math_floor(const Slot *a, int n, Slot *r)
+{ (void)n; putd(r, jfloor(sd(a, 0))); }
+static void nat_Math_toRadians(const Slot *a, int n, Slot *r)
+{ (void)n; putd(r, sd(a, 0) * (3.141592653589793 / 180.0)); }
+static void nat_Math_toDegrees(const Slot *a, int n, Slot *r)
+{ (void)n; putd(r, sd(a, 0) * (180.0 / 3.141592653589793)); }
 
 /* ------------------------------------------------------------------ */
 /* java.lang.System / Runtime / Thread / Throwable                      */
@@ -1530,6 +2036,10 @@ static void nat_Thread_sleep(const Slot *a, int n, Slot *r)
 static void nat_Thread_yield(const Slot *a, int n, Slot *r)
 { (void)a; (void)n; (void)r; midp_paint_pump(); }
 
+/* Thread.activeCount() — cooperative runtime: exactly one thread     */
+static void nat_Thread_activeCount(const Slot *a, int n, Slot *r)
+{ (void)a; (void)n; r[0].w = 1; }
+
 /* Thread.<init>(Runnable): remember the runnable in slot 0 — start()
  * needs it when the Thread base class itself was instantiated.     */
 static void nat_Thread_init_R(const Slot *a, int n, Slot *r)
@@ -1594,6 +2104,28 @@ static int parse_int_radix(const char *s, int radix)
     return neg ? -v : v;
 }
 
+/* Long.parseLong / Long.valueOf(String): same shape at s64 width     */
+static s64 parse_long_radix(const char *s, int radix)
+{
+    s64 v = 0; int any = 0, neg = 0;
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+    if (*s == '-') { neg = 1; s++; }
+    else if (*s == '+') s++;
+    for (; *s; s++) {
+        int d;
+        char c = *s;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'a' && c <= 'z') d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'Z') d = c - 'A' + 10;
+        else break;
+        if (d >= radix) break;
+        v = v * radix + d;
+        any = 1;
+    }
+    if (!any) { fpj_throw(fpj_new_exception("java/lang/NumberFormatException", s)); return 0; }
+    return neg ? -v : v;
+}
+
 static void nat_Integer_parseInt(const Slot *a, int n, Slot *r)
 {
     (void)n;
@@ -1618,17 +2150,265 @@ static void nat_Integer_parseInt_R(const Slot *a, int n, Slot *r)
 static void nat_Integer_toString(const Slot *a, int n, Slot *r)
 { (void)n; nat_String_valueOf_I(a, 1, r); }
 
-static void nat_Integer_valueOf(const Slot *a, int n, Slot *r)
+/* ---- java.lang wrapper boxing (CLDC 1.1 + Java 5 autoboxing) -------
+ * AC2 froze exactly here: its settings menus box ints (Integer.valueOf)
+ * and the unmodeled native degraded to a null return -> NPE -> freeze.
+ * Payload layout shared by every wrapper: SLOT 0 = the value, stored
+ * SIGN-EXTENDED to int range for the sub-int types (Byte/Short;
+ * *Value() truncates on the way out); Long spreads its 64-bit value
+ * over SLOT 0+1. Every instance carries >= 2 payload words (the
+ * native_new floor) or >= 4 (the interpreter's 'new' opcode floor), so
+ * all stores stay in bounds and a hand-rolled 'new Integer(3)' is
+ * interchangeable with valueOf(3).
+ *
+ * A 256-entry Integer cache (-128..127) is DELIBERATELY skipped: the
+ * GC pin stack is only 64 deep (heap.c) and would silently drop pins
+ * past that. Boolean is the one wrapper whose J2SE semantics games
+ * test with == (TRUE/FALSE singletons), and two pins are affordable.
+ * Value identity elsewhere is covered by value-based equals().
+ * ------------------------------------------------------------------ */
+static JRef box_int_like(const char *cls, u32 v)
 {
-    (void)n;
-    JRef o = native_new("java/lang/Integer", 2);
+    JRef o = native_new(cls, 2);
     JObj *t = obj(o);
-    if (t) SLOT(t, 0) = a[0].w;
-    r[0].ref = o;
+    if (t) SLOT(t, 0) = v;
+    return o;
 }
 
+static JRef box_long2(u32 lo, u32 hi)
+{
+    JRef o = native_new("java/lang/Long", 2);
+    JObj *t = obj(o);
+    if (t) { SLOT(t, 0) = lo; SLOT(t, 1) = hi; }
+    return o;
+}
+
+static JRef wrap_true, wrap_false;      /* Boolean singletons, pinned  */
+static JRef box_boolean(int v)
+{
+    JRef *slot = v ? &wrap_true : &wrap_false;
+    if (!*slot) {
+        *slot = native_new("java/lang/Boolean", 2);
+        if (!*slot) return 0;
+        pin_ref(*slot);                 /* dropped by natives_reset()  */
+        JObj *t = obj(*slot);
+        if (t) SLOT(t, 0) = v ? 1 : 0;
+    }
+    return *slot;
+}
+
+/* valueOf() factories ------------------------------------------------ */
+static void nat_Integer_valueOf(const Slot *a, int n, Slot *r)
+{ (void)n; r[0].ref = box_int_like("java/lang/Integer", a[0].w); }
+
+static void nat_Integer_valueOf_S(const Slot *a, int n, Slot *r)
+{
+    (void)n; char buf[32]; str_to_c(AR(a, 0), buf, sizeof buf);
+    r[0].ref = box_int_like("java/lang/Integer",
+                            (u32)parse_int_radix(buf, 10));
+}
+
+/* AC2's sound-prompt call: Integer.valueOf(String, radix) — the diag
+ * m: line carries no signature, so the radix overload is covered too */
+static void nat_Integer_valueOf_SR(const Slot *a, int n, Slot *r)
+{
+    (void)n; char buf[32]; str_to_c(AR(a, 0), buf, sizeof buf);
+    s32 radix = AI(a, 1);
+    if (radix < 2 || radix > 36) {
+        fpj_throw(fpj_new_exception("java/lang/NumberFormatException", "radix"));
+        return;
+    }
+    r[0].ref = box_int_like("java/lang/Integer",
+                            (u32)parse_int_radix(buf, radix));
+}
+
+/* parse_int_radix's inverse: Integer.toString(v, radix) / (this,radix) */
+static void int_to_str_radix(char *out, int cap, s32 v, int radix)
+{
+    static const char digits[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+    char tmp[33]; int t = 0, neg = v < 0, i = 0;
+    u32 u = neg ? 0u - (u32)v : (u32)v;   /* INT_MIN-safe */
+    do { tmp[t++] = digits[u % (u32)radix]; u /= (u32)radix; } while (u);
+    if (neg && i < cap - 1) out[i++] = '-';
+    while (t && i < cap - 1) out[i++] = tmp[--t];
+    out[i] = 0;
+}
+
+static void nat_Integer_toString_R(const Slot *a, int n, Slot *r)
+{   /* static toString(int, radix): a[0]=v, a[1]=radix. (The INSTANCE
+     * toString(radix) form is deliberately not modeled: its sig
+     * "(I)Ljava/lang/String;" is identical to the static toString(int)
+     * and the registry cannot tell them apart — CLDC omits it too.) */
+    (void)n;
+    s32 radix = AI(a, 1);
+    if (radix < 2 || radix > 36) radix = 10;
+    char out[36];
+    int_to_str_radix(out, sizeof out, AI(a, 0), radix);
+    r[0].ref = mkstr(out);
+}
+
+static void nat_Long_valueOf(const Slot *a, int n, Slot *r)
+{ (void)n; r[0].ref = box_long2(a[0].w, a[1].w); }
+
+static void nat_Long_parseLong(const Slot *a, int n, Slot *r)
+{
+    (void)n; char buf[32]; str_to_c(AR(a, 0), buf, sizeof buf);
+    s64 v = parse_long_radix(buf, 10);
+    r[0].w = (u32)(u64)v; r[1].w = (u32)((u64)v >> 32);
+}
+
+static void nat_Long_valueOf_S(const Slot *a, int n, Slot *r)
+{
+    (void)n; char buf[32]; str_to_c(AR(a, 0), buf, sizeof buf);
+    s64 v = parse_long_radix(buf, 10);  /* NFE pending on garbage      */
+    r[0].ref = box_long2((u32)(u64)v, (u32)((u64)v >> 32));
+}
+
+static void nat_Byte_valueOf(const Slot *a, int n, Slot *r)
+{ (void)n; r[0].ref = box_int_like("java/lang/Byte",
+                                   (u32)(s32)(s8)AI(a, 0)); }
+
+static void nat_Byte_parseByte(const Slot *a, int n, Slot *r)
+{   /* AC2 settings parsing: parseByte(String) = parseInt narrowed    */
+    (void)n; char buf[32]; str_to_c(AR(a, 0), buf, sizeof buf);
+    r[0].w = (u32)(s32)(s8)parse_int_radix(buf, 10);
+}
+
+static void nat_Short_valueOf(const Slot *a, int n, Slot *r)
+{ (void)n; r[0].ref = box_int_like("java/lang/Short",
+                                   (u32)(s32)(s16)AI(a, 0)); }
+
+static void nat_Character_valueOf(const Slot *a, int n, Slot *r)
+{ (void)n; r[0].ref = box_int_like("java/lang/Character", a[0].w & 0xFFFF); }
+
+static void nat_Boolean_valueOf(const Slot *a, int n, Slot *r)
+{ (void)n; r[0].ref = box_boolean(a[0].w ? 1 : 0); }
+
+static void nat_Boolean_valueOf_S(const Slot *a, int n, Slot *r)
+{   /* J2SE: "true" (case-insensitive) -> TRUE, anything else -> FALSE */
+    (void)n; char buf[16]; str_to_c(AR(a, 0), buf, sizeof buf);
+    r[0].ref = box_boolean(buf[0] == 't' || buf[0] == 'T');
+}
+
+/* constructors: 'new X(v)' writes the same payload as valueOf() ------ */
+static void nat_Integer_init(const Slot *a, int n, Slot *r)
+{ (void)n; (void)r; JObj *t = THISO(a); if (t) SLOT(t, 0) = a[1].w; }
+
+static void nat_Long_init(const Slot *a, int n, Slot *r)
+{ (void)n; (void)r; JObj *t = THISO(a);
+  if (t) { SLOT(t, 0) = a[1].w; SLOT(t, 1) = a[2].w; } }
+
+static void nat_Byte_init(const Slot *a, int n, Slot *r)
+{ (void)n; (void)r; JObj *t = THISO(a);
+  if (t) SLOT(t, 0) = (u32)(s32)(s8)a[1].w; }
+
+static void nat_Short_init(const Slot *a, int n, Slot *r)
+{ (void)n; (void)r; JObj *t = THISO(a);
+  if (t) SLOT(t, 0) = (u32)(s32)(s16)a[1].w; }
+
+static void nat_Character_init(const Slot *a, int n, Slot *r)
+{ (void)n; (void)r; JObj *t = THISO(a);
+  if (t) SLOT(t, 0) = a[1].w & 0xFFFF; }
+
+static void nat_Boolean_init(const Slot *a, int n, Slot *r)
+{ (void)n; (void)r; JObj *t = THISO(a);
+  if (t) SLOT(t, 0) = a[1].w ? 1 : 0; }
+
+/* *Value() accessors -------------------------------------------------- */
 static void nat_Integer_intValue(const Slot *a, int n, Slot *r)
 { (void)n; JObj *t = THISO(a); r[0].w = t ? SLOT(t, 0) : 0; }
+
+/* WWG narrows an Integer back to byte (its text-decode path);
+ * Java semantics: (byte) of the int value, sign-extended            */
+static void nat_Integer_byteValue(const Slot *a, int n, Slot *r)
+{ (void)n; JObj *t = THISO(a);
+  r[0].w = t ? (u32)(s32)(s8)(SLOT(t, 0) & 0xFF) : 0; }
+
+static void nat_Long_longValue(const Slot *a, int n, Slot *r)
+{ (void)n; JObj *t = THISO(a);
+  r[0].w = t ? SLOT(t, 0) : 0; r[1].w = t ? SLOT(t, 1) : 0; }
+
+static void nat_Byte_byteValue(const Slot *a, int n, Slot *r)
+{ (void)n; JObj *t = THISO(a);
+  r[0].w = t ? (u32)(s32)(s8)(SLOT(t, 0) & 0xFF) : 0; }
+
+static void nat_Short_shortValue(const Slot *a, int n, Slot *r)
+{ (void)n; JObj *t = THISO(a);
+  r[0].w = t ? (u32)(s32)(s16)(SLOT(t, 0) & 0xFFFF) : 0; }
+
+static void nat_Character_charValue(const Slot *a, int n, Slot *r)
+{ (void)n; JObj *t = THISO(a); r[0].w = t ? (SLOT(t, 0) & 0xFFFF) : 0; }
+
+static void nat_Boolean_booleanValue(const Slot *a, int n, Slot *r)
+{ (void)n; JObj *t = THISO(a); r[0].w = (t && SLOT(t, 0)) ? 1 : 0; }
+
+/* toString(): instance form for every wrapper ------------------------ */
+static void nat_w1_toString(const Slot *a, int n, Slot *r)
+{   /* Integer / Byte / Short: SLOT 0 already holds sign-extended int  */
+    (void)n; JObj *t = THISO(a);
+    Slot tmp[1]; tmp[0].w = t ? SLOT(t, 0) : 0;
+    nat_String_valueOf_I(tmp, 1, r);
+}
+
+static void nat_Long_toString_inst(const Slot *a, int n, Slot *r)
+{
+    (void)n; JObj *t = THISO(a);
+    Slot tmp[2];
+    tmp[0].w = t ? SLOT(t, 0) : 0; tmp[1].w = t ? SLOT(t, 1) : 0;
+    nat_String_valueOf_J(tmp, 1, r);
+}
+
+static void nat_Long_toString_J(const Slot *a, int n, Slot *r)
+{ (void)n; nat_String_valueOf_J(a, 1, r); }      /* static toString(J) */
+
+static void nat_Boolean_toString(const Slot *a, int n, Slot *r)
+{ (void)n; JObj *t = THISO(a);
+  r[0].ref = mkstr((t && SLOT(t, 0)) ? "true" : "false"); }
+
+static JRef char_to_string(u32 c)
+{   /* single UTF-16 char -> String (ASCII 1 byte, else 2-3 UTF-8)     */
+    char b[4]; int k = 0; c &= 0xFFFF;
+    if (c < 0x80) b[k++] = (char)c;
+    else if (c < 0x800) {
+        b[k++] = (char)(0xC0 | (c >> 6));
+        b[k++] = (char)(0x80 | (c & 0x3F));
+    } else {
+        b[k++] = (char)(0xE0 | (c >> 12));
+        b[k++] = (char)(0x80 | ((c >> 6) & 0x3F));
+        b[k++] = (char)(0x80 | (c & 0x3F));
+    }
+    return str_from_utf8(b, (u32)k);
+}
+
+static void nat_Character_toString(const Slot *a, int n, Slot *r)
+{ (void)n; JObj *t = THISO(a);
+  r[0].ref = char_to_string(t ? SLOT(t, 0) : 0); }
+
+/* equals()/hashCode(): value-based, per J2SE wrapper semantics ------- */
+static int wrapper_payload_eq(JObj *x, JObj *y, int cells)
+{
+    if (!x || !y || x->clazz != y->clazz) return 0;
+    for (int i = 0; i < cells; i++)
+        if (SLOT(x, i) != SLOT(y, i)) return 0;
+    return 1;
+}
+
+static void nat_w1_equals(const Slot *a, int n, Slot *r)
+{ (void)n; r[0].w = wrapper_payload_eq(THISO(a), obj(AR(a, 1)), 1) ? 1 : 0; }
+
+static void nat_w2_equals(const Slot *a, int n, Slot *r)
+{ (void)n; r[0].w = wrapper_payload_eq(THISO(a), obj(AR(a, 1)), 2) ? 1 : 0; }
+
+static void nat_w1_hashCode(const Slot *a, int n, Slot *r)
+{ (void)n; JObj *t = THISO(a); r[0].w = t ? SLOT(t, 0) : 0; }
+
+static void nat_Long_hashCode(const Slot *a, int n, Slot *r)
+{ (void)n; JObj *t = THISO(a);       /* (int)(v ^ (v >>> 32))          */
+  r[0].w = t ? (SLOT(t, 0) ^ SLOT(t, 1)) : 0; }
+
+static void nat_Boolean_hashCode(const Slot *a, int n, Slot *r)
+{ (void)n; JObj *t = THISO(a);
+  r[0].w = (t && SLOT(t, 0)) ? 1231 : 1237; }
 
 static void nat_Throwable_init(const Slot *a, int n, Slot *r)
 {
@@ -1866,6 +2646,30 @@ static void nat_Hashtable_isEmpty(const Slot *a, int n, Slot *r)
 static void nat_Hashtable_containsKey(const Slot *a, int n, Slot *r)
 { (void)n; JObj *t = THISO(a);
   r[0].w = (t && ht_find(t, AR(a, 1))) ? 1 : 0; }
+
+/* Hashtable.remove(Object) — WWG clears settings-map entries: return
+ * the old value, compact the pair array (order preserved), drop the
+ * count. Missing key returns null (Java).                          */
+static void nat_Hashtable_remove(const Slot *a, int n, Slot *r)
+{
+    (void)n; JObj *t = THISO(a);
+    r[0].ref = 0;
+    if (!t) return;
+    JObj *p = obj(SLOT(t, 0));
+    if (!p || p->type != T_ARR_A) return;
+    JRef *kv = (JRef *)ARR_DATA(p);
+    u32 cnt = SLOT(t, 3);
+    for (u32 i = 0; i < cnt; i++) {
+        if (kv[i * 2] == AR(a, 1) || strequal(kv[i * 2], AR(a, 1))) {
+            r[0].ref = kv[i * 2 + 1];
+            memmove(&kv[i * 2], &kv[(i + 1) * 2],
+                    (size_t)(cnt - i - 1) * 2 * sizeof(JRef));
+            kv[(cnt - 1) * 2] = 0; kv[(cnt - 1) * 2 + 1] = 0;
+            SLOT(t, 3) = cnt - 1;
+            return;
+        }
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /* javax.microedition.lcdui — Image / Graphics / Canvas / GameCanvas    */
@@ -2114,6 +2918,49 @@ static void nat_Gfx_setClip(const Slot *a, int n, Slot *r)
     gfx_clip(&g, AI(a, 1), AI(a, 2), AI(a, 3), AI(a, 4));
     gfx_store(AR(a, 0), &g, c);
 }
+/* clipRect: INTERSECT with the current clip (JSR-118) — the inverse
+ * of setClip's replace semantics; negative w/h just empties it     */
+static void nat_Gfx_clipRect(const Slot *a, int n, Slot *r)
+{
+    (void)n; (void)r; MGraphics g; u16 c;
+    if (!gfx_of(AR(a, 0), &g, &c)) return;
+    gfx_clip_rect(&g, AI(a, 1), AI(a, 2), AI(a, 3), AI(a, 4));
+    gfx_store(AR(a, 0), &g, c);
+}
+/* drawArc / fillArc (Round 9, WWG): negative width/height raises
+ * IllegalArgumentException exactly like JSR-118 — the game's own
+ * catch blocks expect it, and a silent no-op would hide bad state   */
+static void nat_Gfx_drawArc(const Slot *a, int n, Slot *r)
+{
+    (void)n; (void)r; MGraphics g; u16 c;
+    if (!gfx_of(AR(a, 0), &g, &c)) return;
+    if (AI(a, 3) < 0 || AI(a, 4) < 0) {
+        fpj_throw(fpj_new_exception("java/lang/IllegalArgumentException",
+                                    "drawArc"));
+        return;
+    }
+    gfx_arc(&g, AI(a, 1), AI(a, 2), AI(a, 3), AI(a, 4),
+            AI(a, 5), AI(a, 6), 0);
+}
+static void nat_Gfx_fillArc(const Slot *a, int n, Slot *r)
+{
+    (void)n; (void)r; MGraphics g; u16 c;
+    if (!gfx_of(AR(a, 0), &g, &c)) return;
+    if (AI(a, 3) < 0 || AI(a, 4) < 0) {
+        fpj_throw(fpj_new_exception("java/lang/IllegalArgumentException",
+                                    "fillArc"));
+        return;
+    }
+    gfx_arc(&g, AI(a, 1), AI(a, 2), AI(a, 3), AI(a, 4),
+            AI(a, 5), AI(a, 6), 1);
+}
+static void nat_Gfx_drawRoundRect(const Slot *a, int n, Slot *r)
+{
+    (void)n; (void)r; MGraphics g; u16 c;
+    if (!gfx_of(AR(a, 0), &g, &c)) return;
+    gfx_draw_roundrect(&g, AI(a, 1), AI(a, 2), AI(a, 3), AI(a, 4),
+                       AI(a, 5), AI(a, 6));
+}
 static void nat_Gfx_getClipX(const Slot *a, int n, Slot *r)
 { (void)n; MGraphics g; u16 c;
   r[0].w = gfx_of(AR(a, 0), &g, &c) ? (g.cx - g.tx) : 0; }
@@ -2185,6 +3032,11 @@ static void nat_Canvas_getWidth(const Slot *a, int n, Slot *r)
 { (void)a; (void)n; r[0].w = FP_LCD_W; }
 static void nat_Canvas_getHeight(const Slot *a, int n, Slot *r)
 { (void)a; (void)n; r[0].w = FP_LCD_H; }
+/* Canvas.<init>: the game's Canvas subclass ctor chain hits this on
+ * super() — must be a real registered native, or every construction
+ * logs a bogus "M:" miss line into the diag overlay              */
+static void nat_Canvas_init(const Slot *a, int n, Slot *r)
+{ (void)a; (void)n; (void)r; }
 static void nat_Canvas_setFullScreenMode(const Slot *a, int n, Slot *r)
 { (void)a; (void)n; (void)r; }
 static void nat_Canvas_serviceRepaints(const Slot *a, int n, Slot *r)
@@ -2238,6 +3090,39 @@ static void nat_DG_drawImage(const Slot *a, int n, Slot *r)
     }
     gfx_draw_region(&g, im, 0, 0, im->w, im->h, transform,
                     AI(a, 2), AI(a, 3), AI(a, 4));
+}
+
+/* drawPixels(byte[], byte[], ...) — Nokia UI API 1.1 (Round 10).
+ * Modeled combo = exactly what a USB-cast MIDlet needs:
+ *   TYPE_USHORT_565_RGB (=565), identity manipulation (0),
+ *   transparencyMask == null (fully opaque).
+ * That hits the one-memcpy-per-row gfx_draw_rgb565 path: 40,960
+ * bytes from a REUSED Java byte[] straight into the target's RGB565
+ * buffer — zero per-pixel math in bytecode, zero allocation, zero
+ * GC churn per frame. `offset` is a BYTE offset into pixels[] (the
+ * cast frame's payload starts at buf[9] right behind the header).
+ * Other formats / manipulations / non-null masks degrade to silent
+ * no-ops (project policy: a stray call from another jar must never
+ * abort boot).                                                    */
+static void nat_DG_drawPixels(const Slot *a, int n, Slot *r)
+{
+    (void)n; (void)r;
+    JObj *t = THISO(a);
+    if (!t) return;
+    MGraphics g; u16 c;
+    if (!gfx_of(SLOT(t, 0), &g, &c)) return;   /* the wrapped Graphics */
+    JObj *arr = obj(AR(a, 1));
+    if (!arr || arr->type != T_ARR_B) return;   /* byte[] pixels        */
+    if (AR(a, 2) != 0) return;                  /* transparencyMask     */
+    s32 off = AI(a, 3), scan = AI(a, 4), x = AI(a, 5), y = AI(a, 6);
+    s32 w = AI(a, 7), h = AI(a, 8);
+    s32 manip = AI(a, 9), format = AI(a, 10);
+    if (format != 565) return;                  /* TYPE_USHORT_565_RGB  */
+    if (manip != 0) return;                     /* identity only        */
+    if (w <= 0 || h <= 0 || scan < w) return;
+    if (off < 0 || (u32)(off + 2 * ((s64)(h - 1) * scan + w)) > ARR_LEN(arr))
+        return;
+    gfx_draw_rgb565(&g, ARR_DATA(arr), off, scan, x, y, w, h);
 }
 
 /* Display --------------------------------------------------------------- */
@@ -2308,6 +3193,8 @@ void natives_reset(void)
 {
     stream_free_all();      /* resource-stream entry buffers           */
     unpin_ref();            /* canvas + display + runtime pins         */
+    wrap_true = 0;          /* Boolean singleton pins (re-box lazily)  */
+    wrap_false = 0;
     fpj_stdout = 0;
     fpj_stderr = 0;
     cur_canvas = 0;
@@ -2494,6 +3381,16 @@ static void nat_Manager_createPlayer(const Slot *a, int n, Slot *r)
     if (t) SET_PTR(t, 0, media_create_player("audio/midi"));
     r[0].ref = o;
 }
+/* createPlayer(InputStream, type) — WWG's music path: same silent
+ * player; the (ignored) stream keeps Java's two-arg overload alive */
+static void nat_Manager_createPlayer_IS(const Slot *a, int n, Slot *r)
+{
+    (void)n; (void)a;
+    JRef o = native_new("javax/microedition/media/Player", 6);
+    JObj *t = obj(o);
+    if (t) SET_PTR(t, 0, media_create_player("audio/midi"));
+    r[0].ref = o;
+}
 static void player_op(const Slot *a, int n, Slot *r, int op)
 {
     (void)n; (void)r;
@@ -2674,6 +3571,33 @@ static void nat_MIDlet_notifyDestroyed(const Slot *a, int n, Slot *r)
 { (void)a; (void)n; (void)r; fpj_midlet_done = 1; }
 static void nat_MIDlet_platformRequest(const Slot *a, int n, Slot *r)
 { (void)a; (void)n; (void)r; }
+/* MIDlet.<init>: the game's MIDlet subclass ctor chains here on
+ * super() before startApp — registered so it never hits the miss log */
+static void nat_MIDlet_init(const Slot *a, int n, Slot *r)
+{ (void)a; (void)n; (void)r; }
+
+/* ---- javax.microedition.lcdui.Command / Displayable (Round 9) --------
+ * WWG builds a softkey Command and attaches it to the canvas. The
+ * command itself is inert here (no softkey chrome is drawn), but the
+ * ctor + attach calls must be REAL natives so they neither degrade
+ * to the zero-returning fallback (which logged a bogus M: line and
+ * returned a hollow object) nor abort on a missing class. Label /
+ * type / priority are stored for future softkey rendering.           */
+static void nat_Command_init(const Slot *a, int n, Slot *r)
+{
+    (void)n; (void)r; JObj *t = THISO(a);
+    if (t) {
+        SLOT(t, 1) = AR(a, 1);              /* label (String)          */
+        SLOT(t, 2) = (u32)AI(a, 2);         /* commandType             */
+        SLOT(t, 3) = (u32)AI(a, 3);         /* priority                */
+    }
+}
+static void nat_Displayable_addCommand(const Slot *a, int n, Slot *r)
+{ (void)a; (void)n; (void)r; }
+static void nat_Displayable_removeCommand(const Slot *a, int n, Slot *r)
+{ (void)a; (void)n; (void)r; }
+static void nat_Displayable_setCommandListener(const Slot *a, int n, Slot *r)
+{ (void)a; (void)n; (void)r; }
 
 /* ------------------------------------------------------------------ */
 /* key-event bridge into the Java canvas                                */
@@ -2821,6 +3745,24 @@ static const NativeEntry natives[] = {
     N("java/io/DataOutputStream", "size", "()I", nat_BAOS_size),
     N("java/io/DataOutputStream", "close", "()V", nat_DOS_flush),
 
+    /* javax.microedition.io "comm:usb" — the Round 10 UsbCast pipe.
+     * open() is registered under BOTH return types (StreamConnection
+     * for fpj2me's own jars, Connection for javac-compiled ones).   */
+    N("javax/microedition/io/Connector", "open", "(Ljava/lang/String;)Ljavax/microedition/io/StreamConnection;", nat_Connector_open),
+    N("javax/microedition/io/Connector", "open", "(Ljava/lang/String;)Ljavax/microedition/io/Connection;", nat_Connector_open),
+    N("javax/microedition/io/Connector", "openInputStream", "(Ljava/lang/String;)Ljava/io/InputStream;", nat_Connector_openInputStream),
+    N("javax/microedition/io/Connector", "openOutputStream", "(Ljava/lang/String;)Ljava/io/OutputStream;", nat_Connector_openOutputStream),
+    N("javax/microedition/io/Connector", "close", "(Ljava/lang/String;)V", nat_Connector_close),
+    N("javax/microedition/io/StreamConnection", "openInputStream", "()Ljava/io/InputStream;", nat_SC_openInputStream),
+    N("javax/microedition/io/StreamConnection", "openOutputStream", "()Ljava/io/OutputStream;", nat_SC_openOutputStream),
+    N("javax/microedition/io/StreamConnection", "close", "()V", nat_SC_close),
+    /* java.io.OutputStream: comm:usb TX + no-op fallback for others  */
+    N("java/io/OutputStream", "write", "(I)V", nat_OutputStream_write_I),
+    N("java/io/OutputStream", "write", "([B)V", nat_OutputStream_write_bulk),
+    N("java/io/OutputStream", "write", "([BII)V", nat_OutputStream_write_bulk),
+    N("java/io/OutputStream", "flush", "()V", nat_OutputStream_flush),
+    N("java/io/OutputStream", "close", "()V", nat_OutputStream_close),
+
     /* java.lang.String */
     N("java/lang/String", "length", "()I", nat_String_length),
     N("java/lang/String", "charAt", "(I)C", nat_String_charAt),
@@ -2856,17 +3798,28 @@ static const NativeEntry natives[] = {
     N("java/lang/StringBuffer", "charAt", "(I)C", nat_SB_charAt),
     N("java/lang/StringBuffer", "setLength", "(I)V", nat_SB_setLength),
 
-    /* java.lang.Math */
+    /* java.lang.Math — complete CLDC 1.1 set (Round 9). The (JJ)J
+     * max/min are the pair WWG's boot actually tripped on.            */
     N("java/lang/Math", "abs", "(I)I", nat_Math_abs_I),
+    N("java/lang/Math", "abs", "(J)J", nat_Math_abs_J),
     N("java/lang/Math", "abs", "(F)F", nat_Math_abs_F),
     N("java/lang/Math", "abs", "(D)D", nat_Math_abs_D),
     N("java/lang/Math", "max", "(II)I", nat_Math_max_I),
     N("java/lang/Math", "min", "(II)I", nat_Math_min_I),
+    N("java/lang/Math", "max", "(JJ)J", nat_Math_max_J),
+    N("java/lang/Math", "min", "(JJ)J", nat_Math_min_J),
     N("java/lang/Math", "max", "(FF)F", nat_Math_max_F),
     N("java/lang/Math", "min", "(FF)F", nat_Math_min_F),
     N("java/lang/Math", "max", "(DD)D", nat_Math_max_D),
     N("java/lang/Math", "min", "(DD)D", nat_Math_min_D),
     N("java/lang/Math", "sqrt", "(D)D", nat_Math_sqrt),
+    N("java/lang/Math", "sin", "(D)D", nat_Math_sin),
+    N("java/lang/Math", "cos", "(D)D", nat_Math_cos),
+    N("java/lang/Math", "tan", "(D)D", nat_Math_tan),
+    N("java/lang/Math", "ceil", "(D)D", nat_Math_ceil),
+    N("java/lang/Math", "floor", "(D)D", nat_Math_floor),
+    N("java/lang/Math", "toRadians", "(D)D", nat_Math_toRadians),
+    N("java/lang/Math", "toDegrees", "(D)D", nat_Math_toDegrees),
 
     /* java.lang.System / Runtime / Thread / Throwable */
     N("java/lang/System", "currentTimeMillis", "()J", nat_System_time),
@@ -2887,16 +3840,96 @@ static const NativeEntry natives[] = {
     N("java/lang/Thread", "sleep", "(J)V", nat_Thread_sleep),
     N("java/lang/Thread", "start", "()V", nat_Thread_start),
     N("java/lang/Thread", "yield", "()V", nat_Thread_yield),
+    N("java/lang/Thread", "activeCount", "()I", nat_Thread_activeCount),
+    N("java/lang/String", "<init>", "()V", nat_String_init_empty),
+    N("java/lang/String", "<init>", "(Ljava/lang/String;)V", nat_String_init_copy),
+    N("java/lang/String", "<init>", "([BII)V", nat_String_init_bytes),
+    N("java/lang/String", "<init>", "([BIILjava/lang/String;)V", nat_String_init_bytes),
+    N("java/lang/String", "<init>", "([C)V", nat_String_init_chars),
+    N("java/lang/String", "<init>", "([CII)V", nat_String_init_chars),
+    N("java/lang/StringBuffer", "append", "(Z)Ljava/lang/StringBuffer;", nat_SB_append_Z),
+    N("java/lang/StringBuffer", "append", "(Ljava/lang/Object;)Ljava/lang/StringBuffer;", nat_SB_append_O),
     N("java/lang/Integer", "parseInt", "(Ljava/lang/String;)I", nat_Integer_parseInt),
     N("java/lang/Integer", "parseInt", "(Ljava/lang/String;I)I", nat_Integer_parseInt_R),
     N("java/lang/Integer", "toString", "(I)Ljava/lang/String;", nat_Integer_toString),
+    N("java/lang/Integer", "toString", "(II)Ljava/lang/String;", nat_Integer_toString_R),
     N("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;", nat_Integer_valueOf),
+    N("java/lang/Integer", "valueOf", "(Ljava/lang/String;)Ljava/lang/Integer;", nat_Integer_valueOf_S),
+    N("java/lang/Integer", "valueOf", "(Ljava/lang/String;I)Ljava/lang/Integer;", nat_Integer_valueOf_SR),
+    N("java/lang/Integer", "<init>", "(I)V", nat_Integer_init),
     N("java/lang/Integer", "intValue", "()I", nat_Integer_intValue),
+    N("java/lang/Integer", "byteValue", "()B", nat_Integer_byteValue),
+    N("java/lang/Integer", "toString", "()Ljava/lang/String;", nat_w1_toString),
+    N("java/lang/Integer", "hashCode", "()I", nat_w1_hashCode),
+    N("java/lang/Integer", "equals", "(Ljava/lang/Object;)Z", nat_w1_equals),
+    N("java/lang/Boolean", "valueOf", "(Z)Ljava/lang/Boolean;", nat_Boolean_valueOf),
+    N("java/lang/Boolean", "valueOf", "(Ljava/lang/String;)Ljava/lang/Boolean;", nat_Boolean_valueOf_S),
+    N("java/lang/Boolean", "<init>", "(Z)V", nat_Boolean_init),
+    N("java/lang/Boolean", "booleanValue", "()Z", nat_Boolean_booleanValue),
+    N("java/lang/Boolean", "toString", "()Ljava/lang/String;", nat_Boolean_toString),
+    N("java/lang/Boolean", "hashCode", "()I", nat_Boolean_hashCode),
+    N("java/lang/Boolean", "equals", "(Ljava/lang/Object;)Z", nat_w1_equals),
+    N("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;", nat_Long_valueOf),
+    N("java/lang/Long", "valueOf", "(Ljava/lang/String;)Ljava/lang/Long;", nat_Long_valueOf_S),
+    N("java/lang/Long", "parseLong", "(Ljava/lang/String;)J", nat_Long_parseLong),
+    N("java/lang/Long", "<init>", "(J)V", nat_Long_init),
+    N("java/lang/Long", "longValue", "()J", nat_Long_longValue),
+    N("java/lang/Long", "toString", "(J)Ljava/lang/String;", nat_Long_toString_J),
+    N("java/lang/Long", "toString", "()Ljava/lang/String;", nat_Long_toString_inst),
+    N("java/lang/Long", "hashCode", "()I", nat_Long_hashCode),
+    N("java/lang/Long", "equals", "(Ljava/lang/Object;)Z", nat_w2_equals),
+    N("java/lang/Byte", "valueOf", "(B)Ljava/lang/Byte;", nat_Byte_valueOf),
+    N("java/lang/Byte", "parseByte", "(Ljava/lang/String;)B", nat_Byte_parseByte),
+    N("java/lang/Byte", "<init>", "(B)V", nat_Byte_init),
+    N("java/lang/Byte", "byteValue", "()B", nat_Byte_byteValue),
+    N("java/lang/Byte", "toString", "()Ljava/lang/String;", nat_w1_toString),
+    N("java/lang/Byte", "hashCode", "()I", nat_w1_hashCode),
+    N("java/lang/Byte", "equals", "(Ljava/lang/Object;)Z", nat_w1_equals),
+    N("java/lang/Short", "valueOf", "(S)Ljava/lang/Short;", nat_Short_valueOf),
+    N("java/lang/Short", "<init>", "(S)V", nat_Short_init),
+    N("java/lang/Short", "shortValue", "()S", nat_Short_shortValue),
+    N("java/lang/Short", "toString", "()Ljava/lang/String;", nat_w1_toString),
+    N("java/lang/Short", "hashCode", "()I", nat_w1_hashCode),
+    N("java/lang/Short", "equals", "(Ljava/lang/Object;)Z", nat_w1_equals),
+    N("java/lang/Character", "valueOf", "(C)Ljava/lang/Character;", nat_Character_valueOf),
+    N("java/lang/Character", "<init>", "(C)V", nat_Character_init),
+    N("java/lang/Character", "charValue", "()C", nat_Character_charValue),
+    N("java/lang/Character", "toString", "()Ljava/lang/String;", nat_Character_toString),
+    N("java/lang/Character", "hashCode", "()I", nat_w1_hashCode),
+    N("java/lang/Character", "equals", "(Ljava/lang/Object;)Z", nat_w1_equals),
     N("java/lang/Throwable", "<init>", "()V", nat_Throwable_init),
     N("java/lang/Throwable", "<init>", "(Ljava/lang/String;)V", nat_Throwable_init),
     N("java/lang/Throwable", "getMessage", "()Ljava/lang/String;", nat_Throwable_getMessage),
     N("java/lang/Throwable", "toString", "()Ljava/lang/String;", nat_Throwable_toString),
     N("java/lang/Throwable", "printStackTrace", "()V", nat_Throwable_printStackTrace),
+
+    /* Standard java.lang exception stubs (Round 9): <init> registered
+     * on the EXACT class so 'new X()' / 'new X(msg)' from bytecode
+     * resolves immediately and Class.forName finds them via
+     * lib_known; getMessage()/toString() still resolve up the stub
+     * chain to the Throwable natives. The super chains themselves
+     * (IndexOutOfBounds -> RuntimeException -> Exception -> Throwable
+     * ...) live in interp.c stub_super_of so catch blocks match.    */
+    N("java/lang/IndexOutOfBoundsException", "<init>", "()V", nat_Throwable_init),
+    N("java/lang/IndexOutOfBoundsException", "<init>", "(Ljava/lang/String;)V", nat_Throwable_init),
+    N("java/lang/ArrayIndexOutOfBoundsException", "<init>", "()V", nat_Throwable_init),
+    N("java/lang/ArrayIndexOutOfBoundsException", "<init>", "(Ljava/lang/String;)V", nat_Throwable_init),
+    N("java/lang/StringIndexOutOfBoundsException", "<init>", "()V", nat_Throwable_init),
+    N("java/lang/StringIndexOutOfBoundsException", "<init>", "(Ljava/lang/String;)V", nat_Throwable_init),
+    N("java/lang/IllegalArgumentException", "<init>", "()V", nat_Throwable_init),
+    N("java/lang/IllegalArgumentException", "<init>", "(Ljava/lang/String;)V", nat_Throwable_init),
+    N("java/lang/IllegalStateException", "<init>", "()V", nat_Throwable_init),
+    N("java/lang/IllegalStateException", "<init>", "(Ljava/lang/String;)V", nat_Throwable_init),
+    N("java/lang/NullPointerException", "<init>", "()V", nat_Throwable_init),
+    N("java/lang/NullPointerException", "<init>", "(Ljava/lang/String;)V", nat_Throwable_init),
+    N("java/lang/ArithmeticException", "<init>", "()V", nat_Throwable_init),
+    N("java/lang/ArithmeticException", "<init>", "(Ljava/lang/String;)V", nat_Throwable_init),
+    N("java/lang/NumberFormatException", "<init>", "()V", nat_Throwable_init),
+    N("java/lang/NumberFormatException", "<init>", "(Ljava/lang/String;)V", nat_Throwable_init),
+    N("java/lang/ClassCastException", "<init>", "()V", nat_Throwable_init),
+    N("java/lang/ClassCastException", "<init>", "(Ljava/lang/String;)V", nat_Throwable_init),
+    N("java/lang/RuntimeException", "<init>", "()V", nat_Throwable_init),
+    N("java/lang/RuntimeException", "<init>", "(Ljava/lang/String;)V", nat_Throwable_init),
 
     /* java.util */
     N("java/util/Random", "<init>", "()V", nat_Random_init),
@@ -2922,6 +3955,7 @@ static const NativeEntry natives[] = {
     N("java/util/Hashtable", "size", "()I", nat_Hashtable_size),
     N("java/util/Hashtable", "isEmpty", "()Z", nat_Hashtable_isEmpty),
     N("java/util/Hashtable", "containsKey", "(Ljava/lang/Object;)Z", nat_Hashtable_containsKey),
+    N("java/util/Hashtable", "remove", "(Ljava/lang/Object;)Ljava/lang/Object;", nat_Hashtable_remove),
 
     /* javax.microedition.lcdui.Image */
     N("javax/microedition/lcdui/Image", "createImage", "(Ljava/lang/String;)Ljavax/microedition/lcdui/Image;", nat_Image_create_str),
@@ -2937,6 +3971,7 @@ static const NativeEntry natives[] = {
     /* com.nokia.mid.ui: drawImage flips via the shared blitter */
     N("com/nokia/mid/ui/DirectUtils", "getDirectGraphics", "(Ljavax/microedition/lcdui/Graphics;)Lcom/nokia/mid/ui/DirectGraphics;", nat_DirectUtils_getDG),
     N("com/nokia/mid/ui/DirectGraphics", "drawImage", "(Ljavax/microedition/lcdui/Image;IIII)V", nat_DG_drawImage),
+    N("com/nokia/mid/ui/DirectGraphics", "drawPixels", "([B[BIIIIIIII)V", nat_DG_drawPixels),
 
     /* javax.microedition.lcdui.Graphics */
     N("javax/microedition/lcdui/Graphics", "setColor", "(I)V", nat_Gfx_setColor_I),
@@ -2946,6 +3981,10 @@ static const NativeEntry natives[] = {
     N("javax/microedition/lcdui/Graphics", "drawRect", "(IIII)V", nat_Gfx_drawRect),
     N("javax/microedition/lcdui/Graphics", "drawLine", "(IIII)V", nat_Gfx_drawLine),
     N("javax/microedition/lcdui/Graphics", "fillTriangle", "(IIIIII)V", nat_Gfx_fillTriangle),
+    N("javax/microedition/lcdui/Graphics", "clipRect", "(IIII)V", nat_Gfx_clipRect),
+    N("javax/microedition/lcdui/Graphics", "drawArc", "(IIIIII)V", nat_Gfx_drawArc),
+    N("javax/microedition/lcdui/Graphics", "fillArc", "(IIIIII)V", nat_Gfx_fillArc),
+    N("javax/microedition/lcdui/Graphics", "drawRoundRect", "(IIIIII)V", nat_Gfx_drawRoundRect),
     N("javax/microedition/lcdui/Graphics", "setClip", "(IIII)V", nat_Gfx_setClip),
     N("javax/microedition/lcdui/Graphics", "getClipX", "()I", nat_Gfx_getClipX),
     N("javax/microedition/lcdui/Graphics", "getClipY", "()I", nat_Gfx_getClipY),
@@ -2963,6 +4002,7 @@ static const NativeEntry natives[] = {
 
     /* Canvas / GameCanvas */
     N("javax/microedition/lcdui/Canvas", "getWidth", "()I", nat_Canvas_getWidth),
+    N("javax/microedition/lcdui/Canvas", "<init>", "()V", nat_Canvas_init),
     N("javax/microedition/lcdui/Canvas", "getHeight", "()I", nat_Canvas_getHeight),
     N("javax/microedition/lcdui/Canvas", "setFullScreenMode", "(Z)V", nat_Canvas_setFullScreenMode),
     N("javax/microedition/lcdui/Canvas", "serviceRepaints", "()V", nat_Canvas_serviceRepaints),
@@ -2976,6 +4016,12 @@ static const NativeEntry natives[] = {
     /* Display / Font */
     N("javax/microedition/lcdui/Display", "getDisplay", "(Ljavax/microedition/midlet/MIDlet;)Ljavax/microedition/lcdui/Display;", nat_Display_get),
     N("javax/microedition/lcdui/Display", "setCurrent", "(Ljavax/microedition/lcdui/Displayable;)V", nat_Display_setCurrent),
+    /* Command / Displayable softkey plumbing (Round 9): inert but
+     * real, so the WWG menu path never hits the no-op fallback     */
+    N("javax/microedition/lcdui/Command", "<init>", "(Ljava/lang/String;II)V", nat_Command_init),
+    N("javax/microedition/lcdui/Displayable", "addCommand", "(Ljavax/microedition/lcdui/Command;)V", nat_Displayable_addCommand),
+    N("javax/microedition/lcdui/Displayable", "removeCommand", "(Ljavax/microedition/lcdui/Command;)V", nat_Displayable_removeCommand),
+    N("javax/microedition/lcdui/Displayable", "setCommandListener", "(Ljavax/microedition/lcdui/CommandListener;)V", nat_Displayable_setCommandListener),
     N("javax/microedition/lcdui/Display", "getCurrent", "()Ljavax/microedition/lcdui/Displayable;", nat_Display_getCurrent),
     N("javax/microedition/lcdui/Font", "getDefaultFont", "()Ljavax/microedition/lcdui/Font;", nat_Font_getDefault),
     N("javax/microedition/lcdui/Font", "getFont", "(III)Ljavax/microedition/lcdui/Font;", nat_Font_getFont),
@@ -2997,6 +4043,7 @@ static const NativeEntry natives[] = {
     /* media */
     N("javax/microedition/media/Manager", "playTone", "(III)V", nat_Manager_playTone),
     N("javax/microedition/media/Manager", "createPlayer", "(Ljava/lang/String;Ljava/lang/String;)Ljavax/microedition/media/Player;", nat_Manager_createPlayer),
+    N("javax/microedition/media/Manager", "createPlayer", "(Ljava/io/InputStream;Ljava/lang/String;)Ljavax/microedition/media/Player;", nat_Manager_createPlayer_IS),
     N("javax/microedition/media/Player", "realize", "()V", nat_Player_realize),
     N("javax/microedition/media/Player", "prefetch", "()V", nat_Player_prefetch),
     N("javax/microedition/media/Player", "start", "()V", nat_Player_start),
@@ -3041,6 +4088,7 @@ static const NativeEntry natives[] = {
 
     /* midlet */
     N("javax/microedition/midlet/MIDlet", "getAppProperty", "(Ljava/lang/String;)Ljava/lang/String;", nat_MIDlet_getAppProperty),
+    N("javax/microedition/midlet/MIDlet", "<init>", "()V", nat_MIDlet_init),
     N("javax/microedition/midlet/MIDlet", "notifyDestroyed", "()V", nat_MIDlet_notifyDestroyed),
     N("javax/microedition/midlet/MIDlet", "platformRequest", "(Ljava/lang/String;)Z", nat_MIDlet_platformRequest),
 
@@ -3115,6 +4163,7 @@ static const char *const known_libs[] = {
     "javax/microedition/lcdui/Form", "javax/microedition/lcdui/List",
     "javax/microedition/lcdui/TextBox", "javax/microedition/lcdui/Alert",
     "javax/microedition/lcdui/Command", "javax/microedition/lcdui/Item",
+    "javax/microedition/lcdui/CommandListener",  /* WWG menu interface  */
     "javax/microedition/midlet/MIDlet",
     "javax/microedition/rms/RecordStore",
     "javax/microedition/rms/RecordListener",
@@ -3122,6 +4171,10 @@ static const char *const known_libs[] = {
     "javax/microedition/media/PlayerListener",
     "com/nokia/mid/ui/DirectUtils",       /* drawImage flips: modeled  */
     "com/nokia/mid/ui/DirectGraphics",
+    "javax/microedition/io/Connector",    /* Round 10: comm:usb pipe   */
+    "javax/microedition/io/StreamConnection",
+    "javax/microedition/io/Connection",
+    "javax/microedition/io/ConnectionNotFoundException",
     "com/nokia/mid/sound/Sound",           /* modeled: silent, STOPPED  */
     "com/nokia/mid/sound/SoundListener",
     "com/nokia/mid/ui/DeviceControl",      /* modeled: lights/vibra off */

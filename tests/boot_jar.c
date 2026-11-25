@@ -83,6 +83,65 @@ void fp_dbg(const char *s) { fputs(s, stderr); fputc('\n', stderr); }
 uint32_t fp_keys_held(void) { return 0; }
 int fp_key_event(fp_key_t *k, int *p) { (void)k; (void)p; return 0; }
 
+/* ---- Round 10: mock USB pipe (same contract as hostcheck.c) ---------
+ * FPJ_USB_FRAMES=N preloads N synthetic UsbCast frames before the
+ * MIDlet boots; when they are consumed the mock reports link-EOF,
+ * which makes UsbCast.run() return (the exit path the target reaches
+ * with the EXIT KEY instead). TX (ACKs) go to stderr for eyeballing. */
+#define BJ_RX_CAP (256 * 1024)
+#define BJ_TX_CAP 256
+static u8  bj_rx[BJ_RX_CAP]; static u32 bj_rx_len, bj_rx_pos;
+static u8  bj_tx[BJ_TX_CAP]; static u32 bj_tx_len;
+static int bj_eof;
+static u16 bj_seed = 0x1234;
+static void bj_feed_frame(void)
+{
+    u8 hdr[9] = { 'F', 'P', 'J', '2', 128, 0, 160, 0, 0 };
+    if (BJ_RX_CAP - bj_rx_len < 9 + 40960) return;
+    memcpy(bj_rx + bj_rx_len, hdr, 9);
+    bj_rx_len += 9;
+    for (u32 i = 0; i < 40960; i += 2) {     /* walkable RGB565 gradient */
+        u16 v = bj_seed + (u16)(i >> 1);
+        bj_rx[bj_rx_len++] = (u8)v;
+        bj_rx[bj_rx_len++] = (u8)(v >> 8);
+    }
+}
+int fp_usb_read(void *dst, unsigned len)
+{
+    u32 avail = bj_rx_len - bj_rx_pos;
+    if (!avail) return bj_eof ? -1 : 0;
+    if (len > avail) len = avail;
+    memcpy(dst, bj_rx + bj_rx_pos, len);
+    bj_rx_pos += len;
+    return (int)len;
+}
+int fp_usb_write(const void *src, unsigned len)
+{
+    if (len > BJ_TX_CAP - bj_tx_len) len = BJ_TX_CAP - bj_tx_len;
+    if (len) { memcpy(bj_tx + bj_tx_len, src, len); bj_tx_len += len; }
+    return (int)len;
+}
+unsigned fp_usb_available(void) { return bj_rx_len - bj_rx_pos; }
+void fp_usb_reset(void) { bj_rx_len = bj_rx_pos = bj_tx_len = 0; bj_eof = 0; }
+/* Round 11: natives call this on comm:usb open; boot_jar's pipe is
+ * "always up" (frames preloaded by fpj_bj_usb_setup), so this is a
+ * permanent success - the cold-init sequence itself is hostcheck's
+ * mock's business (usb_cold_seqs).                                     */
+int fp_usb_init(void) { return 0; }
+void fpj_bj_usb_setup(int nframes)
+{
+    for (int i = 0; i < nframes; i++) bj_feed_frame();
+    bj_eof = 1;          /* after the scripted frames: link gone       */
+    fprintf(stderr, "[usb] fed %d synthetic frames (EOF after)\n", nframes);
+}
+void fpj_bj_usb_report(void)
+{
+    fprintf(stderr, "[usb] tx bytes: %u: ", bj_tx_len);
+    for (u32 i = 0; i < bj_tx_len && i < 32; i++)
+        fputc(bj_tx[i] >= 32 && bj_tx[i] < 127 ? bj_tx[i] : '?', stderr);
+    fputc('\n', stderr);
+}
+
 fp_file *fp_fopen(const char *p, const char *m) { return (fp_file *)fopen(p, m); }
 int fp_fread(void *b, int s, int n, fp_file *f) { return (int)fread(b, s, n, (FILE *)f); }
 int fp_fwrite(const void *b, int s, int n, fp_file *f) { return (int)fwrite(b, s, n, (FILE *)f); }
@@ -122,6 +181,15 @@ int main(int argc, char **argv)
         if (pump_n < 0) pump_n = 3;
     }
 
+    /* Round 10: preload synthetic UsbCast frames when asked for      */
+    const char *uf = getenv("FPJ_USB_FRAMES");
+    if (uf && *uf) {
+        int nf = (int)strtol(uf, 0, 10);
+        if (nf < 0) nf = 0;
+        if (nf > 5) nf = 5;
+        fpj_bj_usb_setup(nf);
+    }
+
 #ifdef __unix__
     const char *skb = getenv("FPJ_STACK_KB");
     if (argc > 2) skb = argv[2];
@@ -136,12 +204,14 @@ int main(int argc, char **argv)
                 fprintf(stderr, "pthread_create failed\n"); return 2;
             }
             pthread_join(th, 0);
+            fpj_bj_usb_report();
             return g_rc != 0 ? 1 : 0;
         }
     }
 #endif
     g_rc = fpj2me_boot(g_jar);
     printf("[result] fpj2me_boot -> %d\n", g_rc);
+    fpj_bj_usb_report();
     if (g_rc != 0) return 1;
 
     /* pump frames like target_main would, then stop. FPJ_PUMP_N runs

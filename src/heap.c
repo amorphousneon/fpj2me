@@ -222,6 +222,27 @@ u32 heap_used_bytes(void)
 
 u32 heap_free_bytes(void) { return FPJ_HEAP_SIZE - heap_used_bytes(); }
 
+/* constructor rebind: 'new String(bytes,off,len)' hands its <init> a
+ * placeholder T_OBJECT allocated by the 'new' opcode, but a real
+ * String is a T_ARR_C built inside the constructor. Point the
+ * CALLER's handle at the new object instead; the placeholder block
+ * becomes ordinary garbage (its ->handle is aimed at the new
+ * object's OLD number, so the sweep recycles that number exactly
+ * once and never the live one). The receiver must be pinned across
+ * the constructor's allocation — the invoke already popped it off
+ * the operand stack into a C local the mark phase cannot see.     */
+void handle_rebind(JRef h, JRef rep)
+{
+    if (!h || h == rep) return;
+    JObj *o2 = obj(rep), *o1 = obj(h);
+    if (!o2 || !o1) return;
+    o1->handle = (u16)rep;          /* placeholder sweep recycles rep    */
+    o2->handle = (u16)h;
+    fpj_objects[h].obj = o2;
+    fpj_objects[rep].obj = 0;
+}
+
+
 JRef ref_alloc(u8 type, u32 payload, void *clazz)
 {
     JObj *o = heap_alloc(payload);
