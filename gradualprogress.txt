@@ -1245,5 +1245,3 @@ External references
   preverify   commercial jars ship preverified already; for your own
               test MIDlets use Oracle WTK 2.5.2 preverify
 
-License: your call — suggested MIT for fpj2me code; vendor files keep
-their own licenses (miniz MIT, stb MIT/PD, font8x8 PD).
