@@ -44,8 +44,8 @@ loading, sound prompt, difficulty menu, story, gameplay, RMS saves.
 20. [License](#license)
 
 The full engineering log — every bug hunt, root cause, and fix from every
-hardware round — is in [`README.txt`](README.txt). This README is the
-user/maintainer guide; README.txt is the lab notebook.
+hardware round — is in [`gradualprogress.txt`](gradualprogress.txt). This README is the
+user/maintainer guide; gradualprogress.txt is the lab notebook.
 
 ---
 
@@ -1275,8 +1275,4 @@ full speed.
 
 <a name="license"></a>
 ## 20. License
-
-Your call — suggested **MIT** for the fpj2me code in this tree. Vendored
-files keep their own licenses (miniz MIT, stb MIT/PD, font8x8 PD). No
-fpdoom files are modified, so fpdoom's Unlicense applies only to the
-unmodified framework you build against.
+GPL v3
