@@ -960,7 +960,4 @@ Vendored third-party code keeps its own licenses: `vendor/miniz.LICENSE`,
 <a name="license"></a>
 ## 20. License
 
-Your call — suggested **MIT** for the fpj2me code in this tree. Vendored
-files keep their own licenses (miniz MIT, stb MIT/PD, font8x8 PD). No
-fpdoom files are modified, so fpdoom's Unlicense applies only to the
-unmodified framework you build against.
+GPLv3
