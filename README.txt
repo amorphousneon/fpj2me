@@ -1,0 +1,1249 @@
+fpj2me — bare-metal CLDC 1.1 + MIDP 2.0 runtime for fpdoom (SC6531E)
+=====================================================================
+
+Target: itel it2163 — Spreadtrum SC6531E, ARM926EJ-S @ 208 MHz,
+ARMv5TE, no FPU (soft-float via libgcc), 4 MB PSRAM, 128x160 RGB565
+LCD, launched by sdboot/fpmenu from a FAT32 microSD card on top of
+Ilya Kurdyukov's fpdoom framework (Unlicense).
+
+STATUS: M0+M1 complete + launcher menu. Full 202-opcode CLDC
+interpreter, classfile parser, mark&sweep GC, native registry (250+
+methods incl. the Nokia Sound/DeviceControl set), tinfl jar reader, stb
+PNG->RGB565 blitter, RMS, silent media, CATCHABLE Java exceptions,
+<clinit> static initialization, cooperative Thread.start(), MIDP-2.0
+JAD property chain (sibling .jad overrides the jar manifest, RFC-822
+continuations, Gameloft IGP/URL non-null fallbacks), per-class CP
+resolution cache (hot-path getfield/putstatic/invokes resolve once),
+NATIVE 128x160 PORTRAIT LCD SCANOUT (MADCTL/CASET/RASET/RAMWR
+reprogrammed ONCE at boot from the app + STOCK-fpdoom refresh flow:
+no per-frame panel register access, the previous frame retired by
+polling the RAW LCDC end-of-capture bit before every submit —
+fpj_lcdc_wait_frame), PORTRAIT D-PAD (fpdoom's --rotate keypad bits
+cleared: physical UP = Canvas UP), and an
+on-phone jar picker (fp_menu.c). 172/172 host checks pass
+(170 unit + 2 stack boots, tests/run.sh); target files compile against
+the real fpdoom headers.
+2026-11-25 (7) HANDLE THE SCREEN EXACTLY LIKE STOCK FPDOOM (real-
+hardware round, on top of (6)): the wrap SURVIVED (6) — adding
+fpj_spi_retire_frame() (the TX_END count-closed gate) did not remove
+the toroidal wrap, it only SHIFTED its phase again (now "YOU WANT TO"
+left / "DO" right, "MISSION FAILED" + "NO / YES" wrapped to the
+bottom edge). That is the proof that the per-frame
+fpj_lcd_gram_reset() register banging ITSELF causes the pixel-count
+mismatch: every gate ORDER — (5) FIFO/BUSY, (6) TX_END — leaves SOME
+phase. Mechanism: a command burst toggles chnl_len / CD / ctl8 / ctl9
+(and parks HLD_EN / RGB565_EN) on the SPI that the LCDC capture
+stream is driving; sys_wait_refresh() cannot fence it because
+lcdc_init() masks LCDC_BASE->irq.en (&= ~1) right after the boot
+frame, so it early-returns while the capture is still running and the
+burst lands mid-stream; the submit then starts a new capture over
+the residue. Meanwhile stock fpdoom/fpmenu drive this exact SPI
+panel with ZERO wrap: MADCTL/CASET/RASET/RAMWR are sent ONCE at boot
+(lcm_init() FORCES page_reset = 0 on SPI panels — syscode.c line
+518), sys_start_refresh() per frame is just clean_dcache() +
+spi_refresh_next() + the LCDC start, and the 20480-word stream
+exactly fills the 128x160 GRAM window, so the write pointer wraps
+modulo 20480 back to (0,0) on its own.
+  THE FIX (fp_platform.c / fpj_lcd.h / target_main.c — still no
+  fpdoom file touched):
+  (1) fpj_lcd_gram_reset() is a DEFAULT NO-OP (page_reset == 0
+      semantics, both buses): the portrait window is installed ONCE
+      at boot by fpj_lcd_apply_portrait() (unchanged — it runs at
+      lcd_appinit(), between lcd_init() and lcdc_init(), while the
+      bus is still in 8-bit command mode, exactly the slot where
+      fpdoom's own lcd_init() programs cmd_init2); fp_lcd_flush()
+      then calls sys_start_refresh() directly, like every stock
+      fpdoom app. The (4)-(6) re-pin machinery survives behind the
+      OPT-IN gram_repin flag: "-- --gram-repin" in config.txt (the
+      "--" separator is the ONLY arg channel — entry.c ERR_EXITs on
+      unknown "-" options; target_main.c main() parses
+      --gram-repin / --gram-repin=1 / gram_repin=1 before the first
+      flush) for a parallel-LCM GC9106-class panel whose page counter
+      genuinely drifts.
+  (2) fpj_lcdc_wait_frame(): the REAL frame-completion gate. Before
+      every sys_start_refresh() (and from fp_lcd_wait()), poll
+      LCDC_BASE->irq.raw & 1 — the RAW end-of-capture bit, which
+      latches regardless of the irq.en mask (en only gates the CPU
+      interrupt; sys_start_refresh() re-sets it per frame so every
+      submitted frame latches it) — then clear it via
+      LCDC_BASE->irq.clr |= 1, bounded by ~50 ms (>10x the worst-case
+      20480-word shift). An armed-flag tracks "submitted, not yet
+      retired" so the first flush (nothing in flight — lcdc_init
+      already waited its own boot frame out) never stalls. This
+      closes the sys_wait_refresh() no-op gap: the LCDC can never be
+      re-armed mid-capture, and fp_screen is only redrawn after the
+      DMA finished reading it.
+  (3) fp_lcd_flush() = fpj_diag_overlay() -> fpj_lcdc_wait_frame()
+      -> fpj_lcd_gram_reset() (no-op) -> sys_start_refresh() — the
+      program fpj_lcd.h fpj_lcd_flush_seq() pins, host-unit-tested.
+  NOT TOUCHED: the boot-time apply_portrait() still runs
+      unconditionally (it is called from sys_init() before main(), so
+      it cannot be flag-dependent — and does not need to be: the
+      window install happens in the panel's 8-bit command state,
+      before any capture exists); mono panels and the letterbox
+      fallback keep their own paths (mono = SKIP; fallback =
+      LCDC_WAIT + submit, no commands).
+  VERIFY: hostcheck 172/172 — 13 lcd-gate units (DEFAULT SPI and LCM
+  programs are exactly LCDC_WAIT,SUBMIT; ZERO per-frame register
+  steps in the default — the (4)/(5)/(6) bug shape pinned as the
+  regression guard; the stream-length == window-area identity
+  (20480 words) that makes the no-re-pin flow land on (0,0);
+  plan-not-applied keeps the wait; mono SKIP; the opt-in gram_repin
+  programs keep TX_END-before-commands / RAMWR-last on SPI and
+  busy-bit on LCM; the flag toggles off->on->off purely; the 544 =
+  4x128+32 signature; the zero-origin window). Target-only files
+  (fp_platform.c / target_main.c) are syntax-checked against the real
+  fpdoom headers (syscode.h) but not compiled into the host check —
+  host behavior unchanged by construction.
+  ON-PHONE EXPECTATION: the whole UI upright and CENTERED — no
+  split at any edge, no toroidal wrap, same refresh flow as fpmenu's
+  own menu on this panel. If a wrap should ever remain, test the
+  one-time window install alone with "-- --gram-repin" (opt-in) as
+  the A/B experiment: default (no re-pin) vs opt-in (re-pin) must
+  differ only in the per-frame commands.
+  CONFIG: sdcard/config.txt documents the flag; the shipped menu
+  line stays DEFAULT (no re-pin):
+    |Java Games| $fpj2me --dir games/fpj2me
+  and the opt-in variant is:
+    |Java Games| $fpj2me --dir games/fpj2me -- --gram-repin
+2026-11-25 (6) CONSTANT (dx=32,dy=4) = 544-WORD TOROIDAL WRAP FIXED
+(real-hardware round, on top of (5)): the D-pad was fixed, the image
+upright, but every frame still wrapped by EXACTLY 544 words --
+"MISSION FAILED" / "DO YOU WANT TO RESTART?" split 32 px from the
+right edge ("MISSION FAILE" / "DO YOU WANT" at the right, "D" /
+"TO" wrapped to the far left), the bottom "NO / YES" softkey bar
+split 4 rows across the bottom and top edges. 4 rows x 128 px +
+32 px = 544 words = 1,088 bytes, CONSTANT across frames within a
+boot, zero pixels lost -- a pure stream-phase shift, not a window
+offset and not drift.
+  AUDIT (both hypotheses from the bug report checked first):
+  - CASET/RASET values: the plan emits CASET 0x2A = 0,0,0,127 and
+    RASET 0x2B = 0,0,0,159 with xoff/yoff 0/0 (the itel-family tables
+    in fpdoom's lcd_config.h are PLAIN 128x160: no +2/+1, and the
+    only override is the documented -DFPJ_LCD_GRAM_XOFF/YOFF for
+    132x162 glass, at most 2/1 -- never 32). A (32,4) phase from the
+    window would need CASET x_start=32 / RASET y_start=4: pinned
+    as a host unit that the plan never emits them. fpdoom itself
+    resets NOTHING per frame on SPI panels (syscode.c: page_reset=0
+    is forced in lcm_init for every SPI LCD; only LCM GC9106/09 get
+    a bare 0x2C), so sys_start_refresh()/spi_refresh_next() prepend
+    no RAMWR and re-pin no window -- the app-side re-pin is the only
+    window setter, and it was correctly ordered (0x2C last).
+  ROOT CAUSE (the stream side): the (5) gate was "SPI TX FIFO
+  real-empty + not busy". That is NOT "frame done": the pixel stream
+  is a COUNT-ARMED transfer (spi_refresh_next sets tx_len = w1*h1 =
+  20480 words and triggers; the LCDC capture engine feeds the SPI TX
+  FIFO at AHB speed while the SPI drains at SPI-clock speed). At the
+  end of a frame the shifter is idle-STARVED waiting for the last
+  words while the pipeline (the LCDC capture FIFO, ~512 = 4x128
+  words, plus the SPI TX FIFO, ~32 words) still owes the frame TAIL:
+  BOTH status flags read idle exactly then. The re-pin fired into
+  that gap: each 8-bit command byte re-wrote tx_len=1 on the
+  still-open count, and the 544 stranded tail words clocked out
+  around the freshly latched RAMWR as uncounted DATA. Pixel (0,0)
+  landed 544 words deep in the GRAM window every frame; the panel
+  wrapped its 20480-word stream cleanly inside the window, so the
+  shift was toroidal, constant (RAMWR re-parks the pointer each
+  frame -> the phase is exactly the stranded tail, never growing)
+  and lost nothing (the tail is real frame data, merely late).
+  512 + 32 = 544 decomposes the measured dy=4 rows and dx=32 px
+  exactly. The stock fpmenu flow never sees this because it never
+  interleaves commands with the stream: its count runs cleanly to
+  20480 every frame.
+  FIX (fp_platform.c + fpj_lcd.h, still no fpdoom file touched):
+  - fpj_spi_retire_frame(): the per-flush gate is now the SPI TX_END
+    TRANSFER-COMPLETION IRQ (int_raw bit 8 -- the same IRQ fpdoom's
+    own spi_wait_tx trusts after every command byte). It cannot
+    latch until the armed 20480-word count has fully SHIFTED, which
+    cannot happen until the LCDC has pushed every word it owes:
+    waiting for it drains shifter + SPI TX FIFO + LCDC capture
+    pipeline to the last bit. FIFO real-empty + not-busy follow as a
+    formality, then the flag is retired (self-cleaning: our command
+    bytes consume their own TX_END inside fpj_spi_send8, so the only
+    thing that sets the flag again is the NEXT frame's completion).
+    Bounded by a 150 ms timeout so a never-closing armed count (e.g.
+    a boot refresh that pushed zero words before the img layer was
+    configured) cannot hang a flush; real frames retire in ~10-30 ms.
+  - fpj_lcd_gram_reset() SPI path: sys_wait_refresh() (LCDC read
+    side; a no-op while lcdc_init keeps the frame IRQ masked) ->
+    fpj_spi_retire_frame() (count CLOSED) -> CASET/RASET/RAMWR.
+    Between 0x2C and pixel (0,0) of the submitted DMA there is
+    provably NOTHING. The LCM path keeps the DBI busy-bit drain
+    (the parallel bus busy bit tracks its FIFO + shifter, so it
+    stays set until the tail has gone out on the wire).
+  - fpj_lcd_apply_portrait() keeps the plain bus-idle gate: it runs
+    from lcd_appinit() BEFORE lcdc_init(), so no frame transfer has
+    been armed yet and FIFO+BUSY is exact there.
+  - fpj_lcd.h fpj_lcd_flush_seq(): the gate ORDER is now a pure,
+    host-unit-tested policy (SPI: LCDC_IRQ, TX_END, BUS_IDLE, CASET,
+    RASET, RAMWR, SUBMIT -- TX_END strictly before every command
+    byte, RAMWR strictly last before the submit; LCM drops TX_END;
+    unapplied/mono = single SKIP).
+  - SPI_FIFO_RST audit: fpdoom never writes the fifo_rst register on
+    ANY chip variant (grep over fpdoom + ums9117), and after TX_END
+    + TXF_REAL_EMPTY + !BUSY the FIFO contains zero words by
+    construction -- a reset pulse would add no correctness, only
+    risk on an undocumented register. Not pulsed, by design.
+  - CS/glitch question: 0x2C is NOT sent in the armed pixel mode.
+    Commands go out in the parked lcd_init command state (HLD_EN /
+    RGB565_EN cleared, 8-bit words, manual CD) -- the state that
+    provably latched MADCTL/CASET/RASET at boot -- and the CS gap
+    between 0x2C and the first DMA word is the same gap every stock
+    fpdoom app has between its boot-time RAMWR and its first frame
+    (fpmenu displays correctly through it), so it is proven harmless
+    on this panel.
+  VERIFY: hostcheck 169/169 -- 10 new units (the exact SPI gate
+  order with TX_END at index 1 and RAMWR last; the (5) bug order
+  pinned as a no-TX_END regression demo; the program stateless
+  across flushes; the LCM order; SKIP for unapplied/mono; the 544 =
+  4x128+32 = 1088-byte signature; the zero-origin window pin). A/B
+  boot rig on the real ac1j2me.jar vs the SHIPPED (5) source tree:
+  identical 43-milestone class/stage trace (26 classes + 17 stages),
+  20/20 sampled PPM frames pixel-identical -- and by construction:
+  the rig compiles only the VM sources, which are byte-identical to
+  (5) (diff vs the shipped zip: only fp_platform.c, fpj_lcd.h,
+  hostcheck.c changed; no rig TU includes them). boot_jar 36KB-stack
+  boots unchanged. ON-PHONE EXPECTATION: the frame pinned to the
+  physical glass at all four edges -- "MISSION FAILED" and "DO YOU
+  WANT TO RESTART?" intact on one line, the "NO / YES" bar whole at
+  the bottom, dx = 0, dy = 0.
+2026-11-25 (5) TOROIDAL WRAP + LANDSCAPE D-PAD FIXED (real-hardware
+round, on top of (4)): the panel was upright 128x160 and the split
+black bar was gone, but (a) the frame's (0,0) landed ~32px right /
+~16 rows down INSIDE the GRAM window — no pixels lost, everything
+wrapped toroidally ("ACRE" on the far left edge, "FIRST TARGET IN"
+continuing on the right; the top line "YOUR MASTER: ALTAIR," on the
+bottom row) — and (b) the D-pad still sent 90-degree-rotated
+landscape directions (physical UP -> J2ME LEFT, DOWN -> RIGHT, LEFT
+-> DOWN, RIGHT -> UP) while CENTER and both soft keys were correct.
+  BUG (a) ROOT CAUSE: the per-frame CASET/RASET/RAMWR re-pin of (4)
+was gated on sys_wait_refresh() alone — which only tracks the LCDC
+frame IRQ, EARLY-RETURNS while that IRQ is masked (lcdc_init masks
+it right after the boot refresh), and can fire while the panel bus
+is still retiring the frame tail (LCDC done != SPI shifter drained /
+LCM FIFO empty). fpdoom's sys_start_refresh()/spi_refresh_next()
+reset NOTHING themselves on the itel SPI panels (page_reset is 0 —
+verified in syscode.c: only LCM GC9106/09 get a bare 0x2C), so the
+app-side re-pin was the ONLY thing parking the GRAM write pointer —
+and command bytes clocked into a live stream are eaten as pixel
+data. The panel then wraps its own 20480-word stream cleanly (the
+area matches), leaving a STABLE (dx,dy) phase: exactly the observed
+no-pixels-lost toroidal shift. On the SPI bus there is a second
+trap: after lcdc_init, spi_refresh_init() has set SPI_TX_HLD_EN
+(CS held across the whole DMA burst) and RGB565_EN — manual 8-bit
+command words sent in that state are not the per-word CS-framed
+transfers the panel latched at boot.
+  BUG (a) FIX (fp_platform.c, still no fpdoom file touched):
+  (PARTIALLY SUPERSEDED 2026-11-25 (6): this drain let the commands
+  LAND (upright, stable) but its flags pass while the frame transfer's
+  word COUNT is still open — the stranded 544-word tail kept the
+  constant (dx=32,dy=4) wrap; (6) added the TX_END retire gate.)
+  - fpj_lcd_bus_idle(): the HARDWARE drain — SPI: TXF_REAL_EMPTY +
+    !BUSY, then retire any latched TX_END; LCM: busy bit clear.
+    Every command burst (fpj_lcd_apply_portrait AND the per-flush
+    fpj_lcd_gram_reset) now waits for the silicon, not the IRQ:
+    sys_wait_refresh() (LCDC DMA stopped reading fp_screen), then
+    fpj_lcd_bus_idle() (bus quiet), THEN 0x2A/0x2B/0x2C — 0x2C last,
+    immediately before the 20480-pixel submit, so pixel (0,0) of
+    fp_screen always clocks out onto a write pointer parked at the
+    window origin (0,0): zero horizontal wrap, zero vertical wrap.
+  - fpj_lcd_cmd() SPI path parks the pixel-stream state for the
+    whole burst: HLD_EN + RGB565_EN cleared (the exact state
+    lcd_init's own MADCTL/CASET/RASET executed in — the state that
+    provably worked at boot), 8-bit words with manual CD, then the
+    saved ctl7 restored so the coming LCDC DMA streams unchanged.
+  - fpj_spi_send8() clears TX_END BEFORE triggering (the 20480-word
+    frame transfer leaves TX_END latched with nobody to consume it —
+    a stale flag turned the END wait into a no-op), keeping the
+    per-byte BUSY/EMPTY sync honest.
+  BUG (b) ROOT CAUSE: fpdoom packs TWO rotations into
+  sys_data.rotate (syscode.h: "rotate = key << 4 | screen") — and
+  entry.c's --rotate parser sets key = scr when one value is given,
+  so fpmenu's stock "$@ = $@ --rotate 3" leaves rotate = 0x33.
+  syscomm.c sys_getkeymap() remaps KEYPAD_UP/DOWN/LEFT/RIGHT plus
+  the digit grid through num_turn[rotate>>4&3] BEFORE fpj2me's
+  rawmap translates the codes — 90-degree-rotated D-pad. CENTER,
+  LSOFT and RSOFT are not in num_turn's domain, which is exactly
+  why the soft keys were already correct.
+  BUG (b) FIX: src/fpj_key.h (new, pure + host-unit-tested like
+  fpj_lcd.h): fpj_key_rotate() clears ONLY the keypad bits 4..5
+  (screen bits 0..1 were already consumed by lcd_init/the portrait
+  plan; unused bits pass through), the shared FPJ_RAWMAP table, and
+  fpj_key_xlate() — the full chain raw -> num_turn -> rawmap -> KP_*
+  replicated from syscomm.c so the host check pins it 1:1.
+  keytrn_init() (fp_platform.c) applies fpj_key_rotate() before
+  sys_getkeymap(): physical UP = Canvas UP (-1), DOWN (-2), LEFT
+  (-3), RIGHT (-4), CENTER/OK = FIRE (-5), LSOFT = SOFT1 (-6),
+  RSOFT = SOFT2 (-7). Non-portrait fallback panels keep fpdoom's
+  rotation so keys match the sideways letterbox.
+  VERIFY: hostcheck 159/159 — 25 new units (fpj_key_rotate bit
+  surgery incl. screen-bit pass-through and unused bits; the four
+  rotate-3 bug-demo directions PINNED as regressions; the four
+  fixed portrait directions; never-rotated CENTER/DIAL/soft keys;
+  digit-grid rotation; the full MIDP -1..-7 contract; unmapped raw
+  -> KP_NONE). boot_jar 36KB-stack boots unchanged; boot_ac1 A/B
+  against the (4) source tree on the real ac1j2me.jar: identical
+  43-milestone class/stage trace, identical key delivery, and 20/20
+  sampled PPM frames pixel-identical — zero regression (the change
+  is target-only + the pure header). ON-PHONE EXPECTATION: the
+  frame pinned to the physical glass (no wrap at any edge) and the
+  D-pad upright in every menu and in-game.
+2026-11-25 (4) LCD SCANOUT FIXED: fpj2me now switches the panel to
+NATIVE 128x160 VERTICAL PORTRAIT and kills the split-screen wrap
+(the "S | DO YO / OUND SET | U WANT SOUND?" shear).
+  THE HARDWARE BUG (two stacked symptoms, one root cause): fpdoom
+  boots the LCD through its shared landscape configuration — most
+  commonly fpmenu's stock config.txt line "$@ = $@ --rotate 3"
+  (entry.c --rotate -> syscode.c lcd_init XORs MADCTL with
+  rtab[3]=0x60, MV goes set, w/h swap) — leaving the panel scanning
+  160x128 LANDSCAPE: MADCTL 0x36 with MV, CASET 0x2A = 0..159, RASET
+  0x2B = 0..127. fpj2me pushed its 128x160 PORTRAIT framebuffer
+  (pitch 128 = 256 bytes/row) into that grid:
+  (a) STRIDE MISMATCH: the panel's RAMWR fill runs 160 addresses per
+      line while our rows are 128 pixels — every row shears by 32
+      pixels, the image wraps around the screen edge, and the DMA
+      window (lcd_appinit mis-clamped w2/h2 to 128x128) never equalled
+      the GRAM window (160x128 = 20480), so the write pointer ended
+      mid-window and the split black bar WANDERED boot-to-boot and
+      frame-to-frame. (The classic GRAM address-window vs DMA
+      transfer-length mismatch.)
+  (b) WRONG ORIENTATION: MADCTL MV transposes the address grid onto
+      the glass, so the portrait J2ME UI rendered sideways.
+  THE FIX (three pieces, all app-side — no fpdoom file is touched;
+  the app is statically linked with fpdoom's system objects, so the
+  LCM/SPI register recipes are replicated 1:1 from syscode.c /
+  lcd_spi.h into fp_platform.c):
+  (1) src/fpj_lcd.h — a PURE plan (host-unit-tested): undo fpdoom's
+      rotate XOR on sys_data.mac to recover the panel's NATIVE
+      portrait MADCTL (the OEM orientation — upright text, the RGB
+      bit and mirror polarity preserved verbatim; landscape-native
+      tables get MV cleared + MY/MX swapped), un-swap w1/h1, and
+      emit CASET 0..127 / RASET 0..159 with the panel's GRAM offsets
+      (FPJ_LCD_GRAM_XOFF/YOFF, default 0 — verified against every
+      128x160 itel/ST7735/GC9106 entry in fpdoom's lcd_config.h; all
+      are plain 128x160 with no +2/+1 offset).
+  (2) fpj_lcd_apply_portrait() (fp_platform.c, called from
+      lcd_appinit — fpdoom's hook BETWEEN lcd_init and lcdc_init,
+      while the bus still sits in 8-bit command mode): sends
+      MADCTL(0x36)/CASET(0x2A)/RASET(0x2B)/RAMWR(0x2C) on BOTH buses
+      (SPI: the lcd_spi.h byte recipe with CD-bit + channel-length
+      save/restore; parallel DBI: lcm_set_mode(1)/lcm_send through
+      the 0x60000000|cs<<26 FIFO window), then patches sys_data
+      BEFORE lcdc_init reads it: w1/h1 = 128x160 (LCDC
+      disp_size/lcm_size AND spi_refresh_next()'s pixel count =
+      exactly 128*160 = 20480 pixels = 40,960 bytes), w2/h2 = 128x160
+      (img.size_xy == fp_screen 1:1, pitch FP_LCD_W). Window ==
+      framebuffer == DMA == GRAM area: the write pointer wraps to
+      (0,0) at every frame end — the invariant fpdoom's own
+      full-screen apps maintain.
+  (3) fpj_lcd_gram_reset() in fp_lcd_flush(): BEFORE every DMA submit
+      (after the diag overlay stamps its strip, after any partial /
+      status draw) the window is re-pinned: sys_wait_refresh() (the
+      previous DMA fully retires), then CASET/RASET/RAMWR again.
+      Any pointer residue — a short frame, a half-composed flush, a
+      GC9106-class buggy page counter — is wiped every frame; the
+      plan is a pure function so the re-pin itself cannot drift.
+  NOT TOUCHED BY DESIGN: monochrome panels and --mac overrides
+  (sys_data.mac & 0x100) and non-128x160 panels (240x320 etc.) keep
+  the old letterbox clamp. (SUPERSEDED 2026-11-25 (5): this entry's
+  original "the keypad needs no rotation" claim was WRONG on real
+  hardware — fpdoom's sys_getkeymap() rotates the raw codes through
+  the KEYPAD bits of sys_data.rotate before our table sees them; see
+  the (5) entry and src/fpj_key.h.) fpmenu/Doom are
+  unaffected (each fpdoom app re-initializes the whole panel in its
+  own sys_init — fpj2me's portrait state dies with the process).
+  fp_menu's footer now prints the real patched panel size (128x160).
+  VERIFY: hostcheck 134/134 — 20 new units (fpj_lcd_plan: the exact
+  it2163 rotate-3 landscape state, rotate-1/rotate-2/native-0,
+  GC9106 RGB-bit preservation, GRAM offsets +2/+1, mono/240x320
+  fallbacks, stateless re-pin stability; fp_screen = 40,960 bytes
+  exactly, 256-byte row stride, row-major fill addressing with exact
+  bounds, flush leaves the frame intact). boot_jar A/B on the real
+  ac1j2me.jar (36 KB stack, 75 s diag rig, PPM screenshots): stage
+  and class sequences IDENTICAL to the WORKINGAC1 baseline, same
+  189-frame paint progress, zero missing natives, zero panics —
+  the change is target-only (fp_platform.c/target_main.c are not
+  compiled into the host check), so host behavior is unchanged by
+  construction. ON-PHONE EXPECTATION: the whole UI (launcher menu,
+  banners, splash, "DO YOU WANT SOUND?" prompt, game) upright in
+  native portrait with the keypad below the screen, no black bar,
+  no wrap, no sideways rendering. If your module letterboxes by
+  2/1 px (132x162 glass), build with -DFPJ_LCD_GRAM_XOFF=2
+  -DFPJ_LCD_GRAM_YOFF=1.
+2026-11-25 (3) AC1 END-TO-END: the "350-second blink" was an INVISIBLE
+MENU — four JSR-118 conformance bugs in graphics/input, found by
+driving the real jar on a screenshot + key-injection host rig.
+  THE MYSTERY: after the loading bar the phone sat on a black screen
+  with a "blinking Gameloft G logo in the bottom-left corner" for 350+
+  seconds; mashing the keypad eventually broke into a menu with
+  corrupted text ("LLLLL...", "AA"/"AAA" softkey boxes). The VM was
+  healthy the whole time (v= climbing at ~215k ops/s, p= at ~10 fps).
+  Disassembly of f.paint's state switch settled it: the screen after
+  the load is state 19 = P() = "DO YOU WANT SOUND?" with YES/NO
+  softkeys. THE GAME WAS NEVER STUCK — the prompt was INVISIBLE, and
+  key-spam answered it (any of SOFT1/FIRE/'4' = YES, SOFT2 = NO).
+  (1) setClip INTERSECTED the previous clip; JSR-118 says it REPLACES
+      it. GLLib's font engine draws every glyph as setClip(cell) +
+      drawImage(sheet, x-off, y-off): the 2nd..Nth glyph's clip
+      intersected the 1st glyph's cell to EMPTY, so ONLY THE FIRST
+      GLYPH of every drawString ever rasterized. The lone orange 'Y'
+      of "YES" at the softkey strip WAS the "blinking Gameloft G";
+      "LLLLL"/"AA" were first-glyphs of menu strings. FIX: gfx_clip
+      replaces the clip (clamped to the destination bounds, still in
+      translated coordinates). clipRect() is the intersecting API.
+  (2) setColor(0)+fillRect produced the PX_TRANSP color-key: GLLib
+      clears its 136x168 off-screen black before blitting it over the
+      screen, and a "transparent" clear made the blit COMPOSITE over
+      the stale frame instead of replacing it — copyright text bled
+      through the sound prompt, layers accumulated. FIX:
+      gfx_color_rgb nudges pure black to PX_BLACK (0x0001) exactly
+      like the PNG decoder's pack565(); drawRGB does the same.
+  (3) Mutable images must start WHITE — JSR-118: "Mutable images are
+      created as blank images containing only white pixels". They
+      were memset to 0 = fully transparent. FIX: image_create fills
+      0xFFFF. (Verified against the spec text, docs.oracle.com.)
+  (4) THE DEAD SOFT KEYS: the input event queue stored MIDP keycodes
+      in a u8 — SOFT1(-6) arrived as keyPressed(250) and the game's
+      keycode->bit table mapped it to bit 0. Digits (48..57) survived
+      the truncation, which is why keypad spam "worked" while the
+      soft keys the prompt actually needed were dead. FIX: the queue
+      entry keeps the full int (midp_input.c evq).
+  (5) THE PHONE FPS: Thread.yield() was a no-op, but GLLib's frame
+      limiter is "while (now-start < 100) Thread.yield();" — paint and
+      input delivery depended on the interpreter's 2^18-dispatch hook,
+      which at the phone's ~215k dispatches/s fires ~1.2x/SECOND (the
+      splash read as ~1 fps with the VM running hot). yield now calls
+      midp_paint_pump() (in_pump/in_deliver re-entrancy guards): the
+      game's own 100 ms limiter paces painting. Host rig: paints
+      track the limiter exactly (~10/s).
+  (6) LAST AC1 NATIVES: Sound.init([BI)V (f.b(I)V re-arms the Sound
+      with aF[i] before every play — the M: line the 6th-row wrap
+      exposed), Graphics.fillTriangle(IIIIII)V (the IGP painter's
+      panel/button fills — new scanline rasterizer in
+      midp_graphics.c), RecordStore.getRecord(I[BI)I (the savegame
+      loader's copy-into-buffer overload, with the MIDP exceptions),
+      and a REAL System.out/.err object (GLLib's font engine printlns
+      on its decode-error path; a null there NPEs a glyph-sheet build
+      the game would otherwise survive).
+  VERIFY: hostcheck 115/115 — 11 new units (setClip-REPLACE glyph
+  cells, opaque-black fill + blit-replaces-target, white mutable
+  init, fillTriangle rasterize + degenerate, getRecord-into at
+  offset + length, System.out/err distinct stubs, println(String)
+  registered, Sound.init([BI)V, Thread.yield entry; the M1 smoke
+  expectation updated to OPAQUE black 0x0001). boot_jar on the real
+  ac1andrew.jar + its sibling .jad inside the 36 KB-stack thread:
+  130 s, ZERO missing natives, no panic, RMS save written. The full
+  scripted flow (YES -> PRESS 5 -> EASY -> intro -> GAMEPLAY)
+  renders every screen clean on the host: sound question with
+  YES/NO, ASSASSIN'S CREED title with PRESS 5, EASY/NORMAL/HARD
+  difficulty select, scrolling story text, and animated rooftop
+  gameplay with the dialogue overlay. On the phone: answer YES or NO
+  at the sound prompt — soft keys and the D-pad now reach the game.
+2026-11-25 (2) AC1 SPLASH SLOW-MOTION FIXED: 0.47 FPS -> healthy
+loop (Nokia Sound state + interpreter hot path + diag flush)
+  DIAG READINGS THAT NAMED IT (real i2163, games/fpj2me/diag):
+  t=62: gc=5 c=29 v=6368k hf=980k k=1 p=26 lp=1 C:java/lang/Stri
+         M:com/nokia/mid/ (clipped at the 16-char screen edge)
+  t=94: v=10458k (+4.09M bytecodes / 32 s = ~128k ops/s), p=41
+         (+15 paints / 32 s = ~2.1 s/frame)
+  The VM was healthy (v growing, no OOM, no deadlock) — three separate
+  target-side bottlenecks stacked up:
+  (1) Nokia Sound.getState() == 0 == SOUND_PLAYING (THE stall).
+      com/nokia/mid/sound/Sound.<init>([BI)V and .setGain(I)V were
+      hitting the graceful-miss no-op, which returns 0. In the Nokia
+      Sound API 0 is SOUND_PLAYING, so GLLib's splash state machine
+      waited out a FULL audio timeout per transition. The API's
+      SOUND_STOPPED is 1: nat_Sound_getState now returns 1 always,
+      and the WHOLE Sound surface is modeled (both <init> forms,
+      init/play/stop/release/resume, setGain/getGain round-tripped
+      through the receiver's slot 1, setSoundListener) plus
+      com/nokia/mid/ui/DeviceControl (setLights/startVibra/stopVibra/
+      flashLights). Nothing in com/nokia/mid/ falls to the no-op
+      fallback anymore — boot_jar on the real ac1j2me.jar confirms
+      ZERO missing-native lines (baseline printed the two above).
+  (2) EVERY getfield/putfield/getstatic/putstatic and invoke re-did
+      its whole name resolution PER EXECUTION: class_load (a LINEAR
+      registry walk with strcmps) + cp_utf8 + find_field/resolve_ref
+      + resolve_virtual up the superclass chain. At GLLib's
+      per-pixel loop density that dominated the ~1600 cycles per
+      bytecode the diag measured. FIX: per-CLASS cp resolution
+      cache (JMethod.cp_cache, allocated in parse_one, zeroed by
+      meta_alloc, dies with the classes on heap_vm_reset). Field
+      ops park the JField* (or CPC_MISS1/2 sentinels for unmodeled
+      library fields); invokes park an InvokeSite {m, rc, kind} —
+      a monomorphic inline cache keyed on the receiver's runtime
+      class; kind-mismatched or polymorphic sites re-resolve and
+      overwrite. invokestatic's JVMS-5.5 clinit also moved into the
+      UNCACHED first execution (it used to class_load + run_clinit
+      on every call). MEASURED (host x86 -O1, same jar, same menu
+      state f.c=19, 40 s rig with a v-delta sampler): 22.2M ->
+      103.3M bytecodes/s = 4.7x; on the ARM9 the removed strcmp
+      walks are relatively heavier (slow PSRAM), so expect at least
+      that factor in the v= rate. iaload/iastore/iadd/imul/if_icmplt
+      themselves were already single load/store+branch sequences
+      (ARR_CHECK bounds test only) — nothing to strip there.
+  (3) THE DIAG OVERLAY FLUSHED THE LCD ITSELF. fpj_diag_overlay()
+      ended in fp_lcd_flush() and was called from midp_paint_pump()
+      -> fpj_io_pump() — i.e. from INSIDE fread during SD reads: a
+      second LCD DMA per 500 ms tick AND a refresh of a half-
+      composed game frame. FIX: the overlay no longer flushes and is
+      no longer pumped from sleep/io; fp_lcd_flush() (fp_platform.c,
+      mirrored by the host stubs) renders the strip right before the
+      REAL sys_start_refresh — exactly one refresh per frame, fully
+      composed. Graphics natives audited alongside: drawRGB/
+      createRGBImage/getRGB are single-pass shift conversions with
+      no intermediate buffers and no hidden flushes; the only flush
+      points remain deliver_repaint() and GameCanvas.flush(), both
+      game-driven.
+  (4) M: NO LONGER CLIPS AT THE SCREEN EDGE: the full
+      "Class.method" wraps onto a 6th strip row (the old 14-char
+      clip showed only "com/nokia/mid/" and hid the method name —
+      exactly the detail that identifies a stall like Sound.getState).
+  VERIFY: 13 new hostcheck units (M: wrap + flush-rendered strip,
+      Sound.getState==1 + full surface + exact-signature lookup,
+      cp_cache re-execution identity) — 98/98 PASS. boot_jar on
+      ac1j2me.jar (36 KB stack): zero missing natives, sibling .jad
+      loads (MIDlet: GLoftASCR), RMS save written, state machine
+      reaches the menu (f.c=19) and the interpreter sustains 4.7x
+      the bytecode rate. On-phone expectations: v= in the hundreds
+      of k/s to M/s range, p= climbing at the game's intended frame
+      rate instead of ~0.47 FPS, M: empty.
+2026-11-25 AC1 NPE-LOOP AFTER THE UBISOFT SPLASH FIXED: JAD + IGP
+property fallbacks in MIDlet.getAppProperty (natives.c)
+  SYMPTOM: on the phone (and reproduced with the host rig) AC1 drew
+  the Gameloft and Ubisoft splashes, then stalled forever and keys
+  did nothing. The rig (tests/boot_jar + the real ac1j2me.jar +
+  timeout) printed the cause raw: "invokevirtual on null:
+  toUpperCase (in a)" — GLLib's string helper NPEs on the null
+  returned by getAppProperty for its IGP/carrier promo keys, and the
+  game catches that NPE in a tight retry loop that never exits.
+  Standalone Gameloft jars ship no JAD, so those keys exist in
+  NEITHER a .jad NOR the jar's MANIFEST.MF.
+  FIX (the full MIDP-2.0 property chain, three layers):
+  (1) SIBLING .JAD LOADING. jad_load_sibling() (jar.c) reads
+      <jar_basename>.jad sitting next to the booted .jar (".jar" ->
+      ".jad", case-insensitive; FPJ_SD_ROOT prefix honored so host
+      and target see the same file). fpj2me_boot() stages it into
+      the new fpj_jad[] RAM buffer right after the manifest, and
+      MIDlet-1 is now taken from the .jad FIRST (fallback:
+      MANIFEST.MF). Both are wiped in fpj2me_shutdown().
+  (2) RFC-822-AWARE LOOKUP. prop_lookup() (natives.c) walks "Key:
+      Value" headers with CRLF or LF endings, case-insensitive keys,
+      left/right value trimming, and continuation lines (a physical
+      line starting with SP/TAB folds into the previous logical
+      line; the CR/LF fold separators are dropped when the value is
+      copied out). Lookup order: fpj_jad first, then fpj_manifest —
+      the .jad overrides the jar per the MIDP-2.0 spec. On-device
+      this costs ZERO extra SD I/O after boot.
+  (3) GAMELOFT IGP/CARRIER FALLBACKS. fpj_app_property() returns
+      clean non-null defaults when a key is absent from BOTH files,
+      so GLLib's unconditional trim()/toUpperCase() cannot NPE:
+        URL-TEMPLATE-GAME / URL-OPERATOR -> "http://localhost/"
+        URL-PT                          -> "0"
+        any "IGP-*" or "URL-*" key      -> "" (empty string)
+      Genuinely unknown keys still return null — standard MIDP
+      "unsupported feature" semantics stay intact for every other
+      midlet.
+  VERIFY: 14 new hostcheck units (run.sh plants a sibling game.jad:
+  .jad-over-manifest override, manifest fallback when absent from
+  the .jad, case-insensitive keys, RFC-822 unfolding across a CRLF+LF
+  mix, present-but-empty values, all four fallback rules,
+  unknown-key null, jad_load_sibling found/absent, shutdown wipes
+  both buffers) — 85/85 PASS. boot_jar on the REAL ac1j2me.jar
+  (36 KB stack): BEFORE: "invokevirtual on null: toUpperCase" + 4
+  NPEs, class loading dead-ends in the catch loop, timeout kill.
+  AFTER: 0 NPEs, the sibling ac1j2me.jad loads (MIDlet: GLoftASCR),
+  boot proceeds through Sound/RecordStore into the live game loop,
+  writes its RMS save, paints ~900 LCD flushes in 90 s (~10 fps)
+  and the state machine answers the left soft key (f.c 0 -> 19) —
+  the post-splash stall is gone; the midlet now sits in its menu
+  waiting for input. Deploy: drop ac1j2me.jad next to ac1j2me.jar
+  on the SD card (optional — the fallbacks alone un-stick GLLib).
+2026-11-24 (2) AC1 GREEN-SCREEN HANG FIXED: <clinit> + lcmp + UTF-8
+(fpj2me.bin 108092 bytes)
+  SYMPTOM: AC1 passed every panic and froze on the GREEN loading
+  screen, last telemetry "entry ok" + class "c" (Gameloft's GLLib core,
+  loaded lazily by the game loop itself). The host rig reproduced it
+  exactly (tests/boot_jar + the real jar + timeout): the frame loop ran
+  but the state machine never left the splash state. THREE bugs, all
+  found by tracing every invoke on the host:
+  (1) <clinit> NEVER RAN (THE HANG). The engine skipped static
+      initializers entirely, so every static kept its default value.
+      AC1's f.<clinit> arms the splash's first-frame flag (f.aa=true)
+      and the double-buffer setup; without it f.O() painted the same
+      empty splash forever while run() repainted 2.3M times per 12 s.
+      FIX: lazy initialization on FIRST ACTIVE USE (JVMS 5.5) — the
+      new/getstatic/putstatic/invokestatic labels, fpj_call_static,
+      and the boot's implicit new all call run_clinit(): done-flag set
+      BEFORE the run (a <clinit> touching its own statics must not
+      re-enter), superclass first (JLS 12.4.1), execution through
+      interp_call so the caller frame survives and blocking natives
+      inside a <clinit> keep pumping, and a throwing <clinit> is
+      logged + swallowed (class stays initialized — the JVM would
+      mark it erroneous; degrading beats a frozen green screen).
+  (2) lcmp OPERANDS INVERTED (the frame limiter). value1 was compared
+      against value2 swapped, so `now - last < 100` waited exactly
+      when it should NOT: the game loop spam-repainted instead of
+      pacing its 10 fps. fcmp/dcmp were already correct; lcmp now
+      matches them (regression test Tst.run5 in the smoke jar).
+  (3) STRING LITERALS STORED RAW UTF-8 BYTES. intern_str/mkstr widened
+      bytes to chars, so "Ä" became TWO chars and GL's glyph lookup
+      indexed the font table past its end EVERY FRAME (AIOOBE, caught,
+      no text ever drawn). FIX: str_from_utf8() decodes modified-UTF-8
+      (JVMS 4.4.7) to UTF-16, malformed bytes degrade to Latin-1;
+      intern_str/mkstr route through it. readUTF already decoded.
+  PLUS natives AC1 needs that were silent no-ops: String.trim /
+      toUpperCase / toLowerCase / compareTo / startsWith / endsWith /
+      substring(I) / indexOf(I) / indexOf(String,I) / getBytes, and
+      DataInputStream.skip(J)J (was a 0-returning no-op). The host
+      rig's clock is now REAL (CLOCK_MONOTONIC + nanosleep) so
+      frame-limited games progress on host — the phone always had a
+      real clock, the old fake frozen one stalled them in the first
+      100 ms wait.
+  RESULT (host rig, real AC1 jar, 40 s): 401 paints at the game's own
+      100 ms frame limit, 3 state transitions, splash -> loading ->
+      TITLE SCREEN rendering text + images, 0 AIOOBE, 0 missing
+      natives beyond the intentional Nokia-Sound no-ops. The IGP URL
+      property probes NPE on missing manifest keys and are caught by
+      the game (same as a real phone without a JAD).
+2026-11-24 AC1 "invokevirtual on null" PANIC FIXED + GLLib hardening
+(native registry now ~190 methods; fpj2me.bin 106448 bytes).
+  THE PANIC: on the phone AC1 red-screened at "invokevirtual on null"
+  (an invoke whose receiver was a stale null from an unmodeled native).
+  Host runs with the real jar could not reproduce the exact phone
+  trigger (memory/keys/time were simulated — all clean), so the fix is
+  both the SYMPTOM and every NULL SOURCE found by audit:
+  (1) REAL EXCEPTIONS (the big one). GLLib wraps every optional-API
+      probe in try/catch, and CLDC jars ship full exception tables.
+      exec_run now PARSES the exception_table (start,end,handler,
+      catch-type per entry, native-endian, indices validated at load)
+      and fpj_throw() + exc_unwind implement JVM semantics: operand
+      stack discarded, exception pushed, pc=handler_pc, typed catch
+      via the (now fully modeled) Exception/Throwable stub super
+      chain, catch-all=0 for finally. invokevirtual/invokeinterface on
+      a null receiver THROWS NullPointerException instead of
+      panicking; so do null getfield/putfield/arraylength/array
+      ops, AIOOBE for array bounds, ClassCastException for checkcast,
+      ArithmeticException for div/rem by zero, NoClassDefFoundError
+      for resolution failures, athrow unwinds for real. Uncaught at a
+      C boundary: fpj2me_boot returns -6 (red "exception in start"
+      + the class name), paint/key callbacks log and survive.
+  (2) NULL SOURCES ELIMINATED: Runtime.getRuntime() (pinned
+      singleton; was a missing-native returning null — the classic
+      `Runtime.getRuntime().freeMemory()` NPE), `ldc class` pushes a
+      REAL Class mirror (was null!), Class.forName() is strict
+      (real .class in jar or a modeled library -> mirror; otherwise a
+      CATCHABLE ClassNotFoundException — the GLLib optional-API
+      probe), Image.createRGBImage/getRGB implemented.
+  (3) Thread.start() NOW WORKS (cooperative, single-threaded): the
+      Runnable's run() is invoked INLINE. GL midlets run their whole
+      game loop on that thread; its Thread.sleep()/serviceRepaints()
+      keep pumping (host: AC1's thread runs its loop at ~35-70 fps).
+      Thread(Runnable) remembers the target; subclass overrides of
+      run() dispatch on the receiver's real class.
+  (4) LIVENESS PUMP IN THE INTERPRETER: AC1's loop busy-polls input
+      and NEVER sleeps (yield-wait on currentTimeMillis). The old
+      pump paths (sleep/serviceRepaints) never fired -> frozen
+      screen. exec_run now polls input + delivers repaints every
+      2^18 instructions (DISPATCH hook; ~25-50 Hz on the 208 MHz
+      ARM926) — paint/key delivery no longer depends on the game's
+      loop style. Re-entrancy guards in deliver/pump.
+  (5) FullCanvas IS-A Canvas: the stub super chain for
+      com/nokia/mid/ui/FullCanvas (and TextEditor) now passes through
+      javax/.../Canvas — repaint()/getWidth()/serviceRepaints() on a
+      FullCanvas subclass previously resolved to the no-op fallback
+      AT THE FIRST STUB (resolve_virtual now walks the WHOLE super
+      chain before degrading to the logged no-op).
+  (6) The six GLLib hardening items: System.getProperty spoof
+      platform=Nokia6300/locale=en-US (+profiles/config/encoding/
+      screen.width/height/jtwi/m3g/wma/hostname, unknown->null);
+      Runtime.freeMemory/totalMemory return REAL arena numbers (both
+      J words), System.gc()/Runtime.gc() run the collector,
+      System.exit acts as notifyDestroyed (menu return);
+      Image.createRGBImage([IIIZ) converts ARGB8888->RGB565+color-key
+      in ONE pass (the Java int[] is GC-able immediately — the 4MB
+      PSRAM memory-lean contract) and Image.getRGB converts back;
+      all 8 TRANS_* re-verified (see conformance notes) + Nokia
+      DirectGraphics.drawImage flip/rotate constants (FLIP_H 0x2000,
+      FLIP_V 0x4000, ROT90/180/270 = 90/180/270) mapped onto the same
+      blitter via DirectUtils.getDirectGraphics; InputStream.read
+      (b,off,len) is exact (len==0 -> 0 before EOF, NPE/IndexOutOfBounds
+      on bad args, full-request-or-EOF on the RAM-backed stream) and
+      skip() advances the offset exactly — plus the FULL data-IO set:
+      DataInputStream (readFully/readByte/Short/Int/Long/UTF/...
+      wraps either stream kind), ByteArrayInputStream, ByteArray+
+      DataOutputStream (GL savegame building); RecordStore.
+      openRecordStore(name,false) on a missing store now THROWS the
+      catchable RecordStoreNotFoundException (create failure throws
+      RecordStoreException), closeRecordStore is per-instance;
+      Integer.parseInt/toString/valueOf (NumberFormatException on
+      junk); canvas pinning fixed (cur_display was unpinned — a GC
+      could sweep it into a dead handle).
+  AC1 STATUS after the fixes: boots with ZERO panics, the game thread
+  runs, repaints flow (~70 fps host). The first REAL screen is
+  Gameloft's IGP splash, which sits black: this particular jar ships
+  no JAD, so the IGP config properties (URL-PT/URL-OPERATOR/
+  URL-TEMPLATE-GAME/IGP-PROMOS, read via getAppProperty) are empty
+  and dataIGP never loads (state stays 18, splash images null).
+  That is app-level GLLib/IGP compatibility work (M2), not a VM bug —
+  the same jar without its JAD misbehaves on real handsets too.
+  Next steps are in the M2 list below.
+  (SUPERSEDED 2026-11-25: with the sibling .jad loader + IGP/URL
+  non-null fallbacks — see the 2026-11-25 entry — GLLib no longer
+  NPE-loops here: the game passes the IGP stage, writes its RMS save
+  and reaches its menu.)
+2026-11-24 AC1 ARRAY-BOUNDS PANIC FIXED (red screen "array index
+out of bounds" after the green loading screen). Reproduced on the
+host with the real AC1 jar (tests/boot_jar.c boots any jar):
+  (1) do_invoke() dispatched natives into an UNINITIALIZED nret
+  slot: no-op/missing natives never write it, so a stale stack word
+  was pushed as the return value. AC1's getClass() returned the
+  Display handle left over in that slot and dispatch "refined"
+  against the wrong class. FIX: nret is zeroed before every native
+  call.
+  (2) getClass()/getResourceAsStream()/InputStream.read() were no-op
+  stubs, so Gameloft's data loader ("\"\".getClass()
+  .getResourceAsStream(name)", the idiom that reads EVERY data file:
+  fonts, levels, IGP) got a null stream and built garbage state
+  (f.bx = -1 -> f.bw[-1] -> the bounds panic). FIX: real
+  implementations — Class mirrors cached per JClass (GC root), jar
+  entry capture into an InputStream object with read()/read([B)
+  /read([BII)/available()/skip()/close(), buffers freed on
+  close() and on suite shutdown. Also added String.equalsIgnoreCase.
+  With these, AC1 boots to "startApp returned; entering pump" and
+  paints frames on the host, inside a 36 KB-stack thread.
+  (3) GC never traced instance fields (only ref arrays): once a
+  collection ran, every object reachable ONLY through a field
+  (f.bw, StringBuffer buffers, Vector elements) was swept mid-use.
+  FIX: iterative mark (explicit 1024-entry worklist, keep-all
+  fallback on overflow — no C recursion on the 36 KB stack) that
+  traces T_OBJECT payload words with the same tolerant handle
+  scan frames already use, plus Class mirrors as roots.
+  (4) RMS: rms/<suite>/ cannot be created (no mkdir in the fpdoom
+  libc) — openRecordStore fell through to null and the game NPE'd
+  at the first getNumRecords. FIX: flat-file fallback
+  (rms_<suite>_<store>.rms) and openRecordStore(name,false) on a
+  missing store now yields an empty store (== what the game's catch
+  block would have produced; this VM has no exception path yet).
+  Also: array-bounds panics now name the method, bytecode offset,
+  index and length ("OOB <m>@<pc> i=<i> len=<n>") instead of the
+  anonymous message the 21-char LCD row truncated into noise.
+2026-11-24 AC1 GREEN-FREEZE FIXED (three stacked causes, all invisible
+on a LIBC_SDIO=3 phone because fpj_panic used to sleep silently with
+the last boot telemetry still on screen — a panic looked EXACTLY like
+a hang):
+  (1) MISSING LIBRARY NATIVES. AC1 froze at "com/nokia/mid/ui",
+  earlier at "java/lang/Object" (AC2: "java/io/ByteArrayInputStream").
+  That white line is the class loaded right before an INVOKE on a
+  method with no registered native (Nokia UI DirectGraphics, library
+  constructors...) -> do_invoke failed -> fpj_panic -> silent freeze.
+  FIX: resolve_virtual now degrades gracefully — a stub-class method
+  with no registry hit is synthesized as a logged NO-OP with a zeroed
+  return (valid 0/false/null), cached on the stub class so the meta
+  arena never grows on hot loops. The log doubles as a natives TODO
+  list; boot continues instead of dying.
+  (2) PANICS ARE NOW VISIBLE. fpj_panic paints a RED banner with the
+  panic message before sleeping — a panic is distinguishable from a
+  hang with no USB log. (Boot failures keep their own red screen.)
+  (3) THE GAMELOFT MAIN LOOP LIVES INSIDE startApp(). GLLib midlets
+  run their whole frame loop there (repaint(); serviceRepaints();
+  Thread.sleep()). fpj2me_pump() only ran AFTER fpj2me_boot() returned
+  — which never happens while startApp blocks — and
+  serviceRepaints() merely flushed the LCD (MIDP: it must BLOCK until
+  the repaint is DELIVERED, i.e. paint() actually runs). The game
+  deadlocked on its first frame with the keypad dead. FIX:
+  serviceRepaints() now delivers paint() synchronously;
+  Thread.sleep()/System.sleep() pump input + repaints in 10 ms slices
+  while sleeping; Display.setCurrent() calls the canvas's showNotify()
+  if present. Re-entrancy (paint/keyPressed dispatched from inside a
+  blocking native while an outer interpreter run is live) is made
+  GC-safe by a new frame-hold stack: interp_call() keeps the outer
+  frame chain marked for the nested call's lifetime.
+  Also hardened: getstatic/putstatic synthesize zero statics for
+  library classes; getfield/putfield on unknown stub fields return
+  0/discard instead of panicking; invokevirtual on a receiver without
+  a clazz pointer (String payloads, arrays) falls back to the static
+  resolution target. Regression coverage: the test midlet is now
+  Gameloft-shaped — startApp BLOCKS in a repaint/serviceRepaints/sleep
+  loop and only returns after 6 delivered paints, asserted per path
+  (serviceRepaints vs pumping sleep); a missing-native call is
+  asserted NOT to panic (60/60).
+2026-11-24 STACK OVERFLOW FIXED (the AC freeze): real Gameloft jars
+(assassin's creed 1/2) froze mid-boot at the green "entry ok" +
+class-name telemetry. ROOT CAUSE: fpdoom gives the app a fixed 36 KB
+stack (sc6531e_fdl.ld EXTRA_SIZE 0x9000); the old class_load recursed
+once per super-chain level and each level's jar_read kept miniz's
+tinfl_decompressor (8376 bytes!) on the C stack -> ~9 KB per
+hierarchy level -> 4 levels = overflow -> SP left the stack region ->
+CPU abort with no red panic = frozen screen. The smoke jar is only
+1-2 levels deep and every host test ran on an 8 MB stack, so nothing
+caught it. FIX: (1) the tinfl state is now one static in BSS
+(single-threaded runtime), (2) class_load is fully ITERATIVE (parse
+down the super chain in a flat loop, link + assign field offsets on
+the way back up) — stack usage no longer depends on hierarchy depth,
+(3) the classfile parser is now total: every read/skip is
+bounds-checked and every constant-pool index validated, so a
+malformed stream fails CLEANLY (red screen, named class) instead of
+walking a wild pointer into an abort. Regression coverage: a
+generated 24-deep-superchain jar (tools/make_deep_jar.py) boots to
+completion inside a host thread with EXACTLY the phone's 36 KB stack
+(tests/run.sh, 56 checks total).
+2026-11-24 black-screen-no-backlight, CLOSED: two causes found.
+(1) fpmenu turns the backlight OFF before launching any app and only
+the app's sys_start() restores it, so "black + backlight off" means the
+image never started. The shipped fpj2me.bin was rebuilt from scratch
+through the real fpdoom two-stage pipeline and is BYTE-IDENTICAL to the
+previous build — the image was never broken; the failure is on the SD
+side (fpmenu's loader loops forever, dark, when the card copy of the
+.bin is truncated / not cleanly ejected — re-copy and verify the byte
+size) or in config.txt (see the $@ rule below; a broken config line
+makes the menu entry silently dead). (2) The Makefile was not
+reproducible with every cross toolchain: Buildroot GCC defaults to
+-fstack-protector-strong (undefined __stack_chk_* under -nostdlib) and
+part1 never got the libgcc soft-float link. Both are fixed in-tree
+(-fno-stack-protector for every TU, -lgcc in BOTH part rules). A red
+"no .jar files" screen now appears when the game folder comes up empty
+(wrong --dir / broken config), instead of a confusing empty menu.
+2026-11 launcher: fpj2me.bin now shows a game-selection menu that lists
+every *.jar in games/fpj2me/, boots the selected jar from its OWN
+manifest (no .jad files needed), and returns to the menu when the
+game exits. RMS stores are per-jar (rms/<jar-name>/). MIDlet exit ->
+notifyDestroyed() no longer hangs: the VM is fully reset and the menu
+comes back. The earlier "steady blue with letterbox bars" report was
+the M1 smoke test SUCCEEDING (Tst paints only after setCurrent, and
+nothing told you boot was done) — every stage now has a distinct
+on-screen state (see "screen colors" below).
+2026-11 on-target fix: first fpmenu launch showed a black screen with
+backlight — root cause was lcd_appinit() leaving display.w2/h2 at 0
+(fpdoom requires the APP to size the framebuffer window; a 0x0 LCDC
+source image scans out nothing). Fixed; blue M0 heartbeat confirmed
+on the it2163 (letterboxed bars are the panel's extra rows — the menu
+footer prints the real w1xh1 so you can confirm the panel geometry).
+2026-11 interpreter fixes (found by the M1 visible smoke test — all
+latent: the old tests only exercised statics): aload_n/istore_n-style
+opcodes consumed a phantom operand AND mis-indexed locals (javac emits
+aload_0 everywhere, no real jar could run); do_invoke dropped `this`
+for zero-arg instance methods; sig_ret_cells read the first ARG instead
+of the return type (void natives pushed garbage); native pointers in
+object slots truncated on 64-bit hosts (now two words, hi=0 on ARM);
+BRANCH BASE BUG — every if_*/goto/goto_w/jsr/tableswitch/lookupswitch
+applied its offset from the address AFTER the instruction instead of
+the OPCODE address (JVM spec), so every branch landed 1-5 bytes off:
+any real jar's control flow would derail immediately. Caught by the
+exit-capable smoke jar (if_icmpne fell into operand bytes -> "invoke:
+unresolved method"); now spec-correct and covered by taken + not-taken
+branch tests.
+What is NOT in yet (M2): Java exceptions (athrow currently panics with
+a message), java threads (cooperative scheduler), the boot.jar java.*
+class library (String is a char-array object today), RecordEnumeration,
+Nokia UI. Threads in Gameloft jars will panic with a clear message —
+that is the next work item, not a mystery crash.
+
+Layout
+------
+  Makefile             fpdoom app-dir Makefile (see integration below)
+  src/platform.h       HAL contract — what fpj2me needs from fpdoom
+  src/fpj_lcd.h        PURE 128x160-portrait LCD plan (host-unit-tested):
+                       undoes fpdoom's rotate XOR, emits the portrait
+                       MADCTL/CASET/RASET values + GRAM offsets, and
+                       fpj_lcd_flush_seq() pins the (7) flush program
+                       (default: LCDC_WAIT -> SUBMIT, no per-frame
+                       registers; opt-in gram_repin full re-pin)
+  src/fpj_key.h        PURE portrait keypad plan (host-unit-tested):
+                       fpj_key_rotate() (clears --rotate's KEYPAD bits
+                       so the D-pad is upright), the shared FPJ_RAWMAP
+                       raw->KP table, fpj_key_xlate() = the full
+                       sys_getkeymap chain replicated from syscomm.c
+  src/fp_platform.c    the ONLY fpdoom-touching implementation (target):
+                       LCM/SPI register replication, portrait switch
+                       (fpj_lcd_apply_portrait, once at boot), the
+                       (7) refresh flow: fpj_lcdc_wait_frame (RAW
+                       end-of-frame poll + 50 ms cap), gram_reset as
+                       an OPT-IN no-op (gram_repin), flush, keys, IO
+  src/target_main.c    app main(): parses the "-- --gram-repin" argv
+                       flag, splash -> menu -> boot -> pump -> menu
+                       (lcd_appinit: the portrait switch hook)
+  src/fp_menu.c/.h     the jar picker: scans the --dir folder for *.jar,
+                       lists, scrolls, auto-repeat, launches (target)
+  src/fp_font.c/.h     8x8 text/fill drawing for menu + status screens
+  src/fpj2me.h         object model (handles), class model, GC, engine
+  src/heap.c           object heap + mark&sweep GC + meta arena + interning
+  src/interp.c         classfile parser + interpreter (202 opcodes, computed
+                       goto) + stub classes for native-only types + boot
+  src/natives.c        THE native registry: java.lang, java.util,
+                       javax.microedition.lcdui/game/rms/media/midlet
+  src/jar.h/.c         JAR/ZIP central-dir reader + tinfl inflate (SD)
+  src/libc_shims.h     minimum libc surface for miniz/stb under -nostdlib
+  src/midp.h           MIDP bridge types, keycodes, TRANS_*, anchors
+  src/midp_image.c     PNG -> RGB565 (stb_image, STBI_ONLY_PNG)
+  src/midp_graphics.c  drawImage/drawRegion(all 8 TRANS)/clip/fill/string
+  src/midp_input.c     keypad -> MIDP keycodes, getGameAction,
+                       GameCanvas.getKeyStates (latched), repeats
+  src/midp_rms.c       RecordStore flat files on SD (log-structured)
+  src/midp_media.c     silent Player/Manager, queued listener events
+  vendor/              miniz 3.0.2 (tinfl), stb_image 2.34,
+                       font8x8.h (generated) — real libs, vendored
+  tools/               fetch_vendor.sh, make_test_jar.py (regenerates
+                       tests/test.jar incl. the hand-assembled Tst.class)
+  tests/               hostcheck.c + boot_jar.c + run.sh: 169 checks,
+                       incl. boots in a 36 KB-stack thread (no hardware)
+
+Integration with your sdboot phone (nothing gets re-flashed)
+------------------------------------------------------------
+sdboot boots fpbin/fpmain.bin from the FAT32 card; fpmenu reads
+fpbin/config.txt and launches app binaries from the card. fpj2me is
+just another app. One-time:
+
+  1. clone fpdoom:      git clone https://github.com/ilyakurdyukov/fpdoom
+  2. copy this dir in:  cp -r fpj2me /path/to/fpdoom/
+  3. build:             cd /path/to/fpdoom/fpj2me
+                        make LIBC_SDIO=3 CHIP=1 TOOLCHAIN=<arm-prefix>
+     (LIBC_SDIO=3 = SD-card file IO, MANDATORY for sdboot apps;
+      CHIP=1 = SC6531E. TOOLCHAIN is the arm-* prefix of your cross
+      gcc — e.g. TOOLCHAIN=arm-buildroot-linux-gnueabi with its bin/
+      on PATH. You get fpj2me.bin.)
+     A prebuilt fpj2me.bin from THIS exact tree (GCC 15 armv5-eabi
+     soft-float, LIBC_SDIO=3 CHIP=1, two-stage fpdoom image verified by
+     disassembly: part2 stub -> part1 reloc -> libgcc soft-float
+     linked) ships next to this README — you can copy it to fpbin/ and
+     test before building. Toolchain note: the VM's float/double
+     opcodes need the ARM soft-float helpers (__aeabi_dadd,
+     __aeabi_fmul, ...); fpdoom links -nostdlib and some toolchains
+     do not pull libgcc in by themselves. THIS Makefile already links
+     libgcc AFTER the objects in its own part2 rule — you need no
+     extra flags. If your link ever reports __aeabi_* undefined, your
+     build is not using this Makefile's rule (stale objects or an old
+     tree copy): make clean and rebuild.
+     Toolchain note 2: the NEWLIB bare-metal toolchains (arm-none-eabi,
+     GCC 16+) default to emulated TLS, and stb_image's thread_local
+     globals then pull libgcc's emutls.o -> undefined malloc/abort.
+     The tree already defines STBI_NO_THREAD_LOCALS in BOTH stb-using
+     TUs (vendor/stb_impl.c and src/midp_image.c) — single-threaded by
+     design, so plain statics are correct. If you re-vendor stb,
+     keep that define.
+  4. SD card (same layout as your other fpdoom games):
+        fpbin/fpj2me.bin             <- the built binary
+        games/fpj2me/*.jar           <- as many jars as you like
+                                       (128x160 builds! menu lists them)
+        games/fpj2me/rms/            <- optional: per-jar RecordStore
+                                       saves. NOT required: with no
+                                       mkdir in the fpdoom libc the
+                                       runtime falls back to flat
+                                       rms_<jar>_<store>.rms files in
+                                       the same folder
+     No .jad files needed: the MIDlet-1 entry class is read from each
+     jar's own META-INF/MANIFEST.MF (the JAD is optional in MIDP).
+  5. add to fpbin/config.txt (same pattern as your other games):
+        |Java games| fpbin/fpj2me.bin $@ --dir games/fpj2me
+     (binaries live in fpbin/, data in games/<name>/ — like retris)
+     ONE fpmenu entry now covers every jar you drop into the folder.
+
+     *** THE $@ RULE (verified against fpmenu's readconf.h) ***
+     The FIRST non-empty, non-comment line of config.txt is NOT a
+     variable definition — it is the argument list fpmenu stores in
+     the $@ variable and prepends to every app it launches:
+        --bright 50 --charge 2
+     Keep the line exactly like that. If your first line reads
+     "$fpj2me = fpbin/fpj2me.bin $@" instead, fpmenu parses that TEXT
+     as $@'s value, $fpj2me never becomes a defined variable, and the
+     menu entry silently stops working (fpmenu looks for a FILE
+     literally named "$fpj2me" and finds nothing). Variables go BELOW
+     the first line. A ready-to-use config.txt ships in sdcard/ of
+     this tree — see sdcard/config.txt.
+
+M1 smoke test (no Gameloft jar needed): the sdcard/ folder in this
+tree is a ready-made games/fpj2me/ — copy its contents to the card
+and launch. VISIBLE result: blue "scanning" flash -> the menu with
+"game" listed -> OK: green "loading" flash -> black screen with a
+GREEN box, "fpj2me M1" + "press a key" text, white 1px border.
+Press any key: box turns RED (keypad -> keyPressed -> repaint -> the
+interpreter re-runs paint()). Press RSOFT (right soft key): the smoke
+midlet calls notifyDestroyed() and the MENU returns — that is the
+same exit path real Gameloft games use. Exit the menu (the <exit>
+entry or RSOFT there) and the phone reboots back to fpmenu (standard
+fpdoom app exit via watchdog).
+
+Everything is read with RELATIVE paths because fpmenu's --dir makes
+fpdoom's startup (entry.c) point the FAT current directory at the
+game folder — exactly how doom1.wad is found. Boot order: sdboot ->
+fpmenu -> fpj2me.bin -> jar menu -> META-INF/MANIFEST.MF -> MIDlet-1
+class -> startApp().
+
+Debugging: build with LIBC_SDIO=0 instead and run under fpdoom's
+libc_server over USB to see fp_dbg() logs (with LIBC_SDIO=3 the USB
+log channel is off; panics still show a red screen).
+
+Troubleshooting: what the screen tells you (one color per stage)
+------------------------------------------------------------------
+  IMPORTANT — the backlight contract: fpmenu switches the backlight
+  OFF the instant it launches any app binary; the ONLY thing that
+  switches it back on is fpj2me's own sys_start(), which now runs
+  BEFORE the first paint of the blue banner. So the color you see
+  (or don't see) tells you exactly how far execution got:
+
+  BLACK + backlight OFF  -> fpj2me.bin never executed a single
+     (nothing at all)      instruction of ours — the backlight never
+                           came back. The image was not loaded or not
+                           started. In order of likelihood:
+                           1. The fpj2me.bin on the card is truncated
+                              or not the file you think: fpmenu's
+                              loader loops FOREVER (black, no
+                              backlight) when the FAT cluster chain
+                              yields fewer bytes than the directory
+                              entry promises. On the PC, compare the
+                              byte size of the card copy with the
+                              built file — they must match EXACTLY —
+                              then recopy, eject the card cleanly
+                              (no cached writes), and reinsert.
+                           2. Wrong path/name: the fpbin/config.txt
+                              line must read
+                              |Java games| fpbin/fpj2me.bin $@ --dir games/fpj2me
+                              and the binary must be at fpbin/fpj2me.bin
+                              (binaries in fpbin/, jars in games/fpj2me/).
+                           3. A build that mislinked (soft-float stubs,
+                              wrong start layout): rebuild with THIS
+                              tree's Makefile (libgcc linked for you)
+                              and re-copy the new file.
+                           4. Card hygiene: FAT32 only (no exFAT), and
+                              a badly fragmented card can break the
+                              cluster chain — copy the files onto a
+                              freshly FAT32-formatted card in one pass.
+                           NOTE: if the phone shows fpmenu again
+                           instead, the app ran and failed BEFORE
+                           sys_init (e.g. --dir not found — that path
+                           is now case- and spelling-exact) and the
+                           watchdog rebooted it: check the config line.
+  BLACK + backlight on  -> fpj2me.bin is running but the LCDC scans
+     out nothing. Fixed in this tree: lcd_appinit() must assign
+     sys_data.display.w2/h2 UNCONDITIONALLY (fpdoom never does).
+     On the it2163 w2=128, h2=160. If you rebuilt from an older
+     scaffold where lcd_appinit only clamped w1/h1, rebuild.
+  BLUE  + "scanning"    -> alive; enumerating the SD folder. Stuck
+     here = SD/FAT problem (rebuild with LIBC_SDIO=0 for USB logs).
+  MENU (black, white     -> everything up to and including FAT works.
+     text, teal bar)        Navigate with UP/DOWN, launch with OK.
+  RED + "no .jar files"  -> the app runs fine but the game folder is
+     + checklist text       empty or wrong (config.txt $@ rule broken,
+                           so --dir never reached us and the scan saw
+                           the SD root). The screen lists what to
+                           check; press a key -> back to fpmenu.
+  GREEN + "loading"     -> the selected jar is being opened, manifest
+     + stage text       parsed, classes loaded, startApp entered.
+                           BOOT TELEMETRY: while booting, the green
+                           screen live-prints a yellow milestone line
+                           (row 9) — heap / open jar / fopen ok / eocd
+                           / cdir / manifest / entry hdr / inflate /
+                           entry ok / class / instance / ctor /
+                           startApp / run — and a white line (row 11)
+                           with the name of each class as it loads.
+                           If the screen freezes, THE LAST VISIBLE
+                           TEXT IS THE DIAGNOSTIC: report it. ("run"
+                           visible but nothing paints = the hang is
+                           in the pump/paint path, not in boot.)
+                           NOTE: Gameloft midlets block INSIDE startApp
+                           (their whole frame loop runs there); the
+                           yellow line may stay at "startApp" while
+                           the game is already painting — paints now
+                           happen through serviceRepaints()/sleep()
+                           during startApp, not only after boot.
+                           STUCK here (no further text, no paint) =
+                           hang inside fpj2me_boot (SD I/O or
+                           classfile) — LIBC_SDIO=0 time.
+  RED + "fpj2me panic"  -> only UNRECOVERABLE states remain (stack/
+     + message             call-depth overflow, OOM while throwing,
+                           invokedynamic). NPE/cast/array-OOB/div0/
+                           athrow/ClassNotFound are CATCHABLE Java
+                           exceptions now — the game's own catch blocks
+                           handle them; uncaught ones during boot give
+                           the "boot failed E:-6 exception in start"
+                           screen instead (row 4 names the class).
+  RED + "boot failed"   -> jar did not start; the screen names the
+     + E-code + name     reason and the jar. E-1 open failed (bad
+                           zip / >2 MB), E-2 no MIDlet-1 in manifest,
+                           E-3 MIDlet class missing, E-4 OOM, E-5 no
+                           startApp method, E-6 an exception escaped
+                           <init>/startApp (row 4 shows the class,
+                           e.g. "uncaught java.lang.Null..."). Press
+                           a key -> back to the menu.
+  Game screen            -> running. Exit via the game's own exit
+                           (notifyDestroyed) -> menu returns.
+  Black bars top/bottom  -> panel is taller than 160: the 128x160
+                           window letterboxes (intended for 128x160
+                           game builds). The menu footer prints the
+                           real panel size so you can confirm.
+  Image wraps toroidally -> the frame's pixel STREAM reached the
+  (text split at one     panel phase-shifted: content shifted right/
+  edge, tail on the      down with the far edge's content wrapped
+  opposite edge, e.g.    around. Fixed in this tree ((6)): the re-pin
+  "MISSION FAILE|D")     is gated on the frame transfer's TX_END word-
+                           count IRQ, so the stranded frame tail can
+                           never clock into the RAMWR stream. If it
+                           EVER reappears after a rebuild, the gate
+                           order regressed — see the fpj_lcd_flush_seq
+                           host units and fpj_spi_retire_frame().
+
+Memory map (PSRAM, within fpdoom's allocation)
+----------------------------------------------
+  fpdoom code+data      ~700 KB
+  fpj2me .text/.rodata  ~220 KB (VM+bridge+tinfl+PNG decoder)
+  fpj_objects           128 KB (32k handles)
+  fpj_heap              1 MiB Java heap (GC arena)
+  fpj_stack              64 KB interpreter frame pool
+  meta arena             512 KB class metadata (bump)
+  fp_screen              40 KB back buffer @128x160
+Total ~2.7 MB of 4 MB — same envelope fpdoom runs Doom in.
+
+MIDP conformance notes (verified against the JSR-118 javadoc)
+------------------------------------------------------------
+  * Sprite.TRANS_* values 0..7 match the spec's constant-values page
+    exactly (TRANS_ROT180=3, TRANS_MIRROR_ROT270=4, TRANS_ROT90=5,
+    TRANS_ROT270=6, TRANS_MIRROR_ROT90=7). Games inline these.
+  * Canvas.getGameAction() returns the OFFICIAL action codes
+    (UP=1, LEFT=2, RIGHT=5, DOWN=6, FIRE=8, GAME_A..D=9..12) — NOT the
+    negative device keycodes (those are only what keyPressed receives).
+  * GameCanvas.getKeyStates() bits are 1 << action code, latched since
+    the previous call, and digits 2/4/6/8/5 count as the nav pad.
+  * Keypad: digits '0'-'9'/'*'/'#' are ASCII; nav = -1..-5, soft
+    keys = -6/-7 (de-facto Nokia/SE values all 2007+ GL builds use).
+  * Raw pad codes (0x04 UP, 0x08 LSOFT, ...) are fpdoom's KEYPAD_ENUM
+    from syscode.h — if a key is dead on your handset, adjust the one
+    table in src/fp_platform.c.
+
+Known limitations (the M2 list)
+-------------------------------
+  * GLLib IGP splash: jars without their JAD (AC1's) lack the IGP
+    config properties, so Gameloft's IGP sits at a black splash
+    (state 18) instead of advancing. Needs JAD property defaults +
+    the dataIGP/GAM unpacking path (the GL packed-image codec is
+    pure Java in the jar; it runs, but its input chain never fires
+    without the IGP config).
+  * Exceptions are single-threaded: a throw unwinds to the nearest
+    handler on the SAME frame chain; catch of interfaces works;
+    finally is a catch-all handler (javac's pattern). No
+    InterruptedException on Thread.sleep, no exception across the
+    cooperative thread boundary (a throw inside run() kills that
+    thread with a log).
+  * Thread.start() is cooperative/inline: no preemption, no second
+    start() while one run() is live (same single loop). Timer/
+    TimerTask are still no-ops (listed as known libs only).
+  * Missing library natives (anything not in the registry) are
+    logged NO-OPS with zeroed returns — boot continues; implement
+    the ones your game actually needs (the "native missing" log
+    lists them).
+  * java/lang/String has no classfile: strings ARE char[] objects;
+    `new String(...)` is not supported (literals + valueOf are).
+    Fixed properly by the M2 boot.jar (real java.* classfiles).
+  * RecordStore.enumerateRecords returns null.
+  * Media is silent by design (no audio HW bring-up).
+
+Testing without hardware
+------------------------
+  tests/run.sh compiles the WHOLE runtime natively against stubbed
+  fp_* primitives and runs 58 checks + 2 boot-stack checks:
+    jar: central-dir scan, stored entries, REAL tinfl inflate
+    blitter: all 8 TRANS_*, transparency, clip/fill/drawString
+    RecordStore: log semantics across reopen
+    PNG: real stb decode to RGB565 at 128x160
+    input: getGameAction/getKeyStates semantics
+    VM: jar manifest -> MIDlet-1 -> class_load -> startApp; interpreter
+        exec (consts/iadd/putstatic/getstatic); native dispatch through
+        stub classes (Math.abs); BRANCHES both taken and not-taken
+        (if_icmpne exit path — guards the spec-correct branch base);
+        notifyDestroyed -> launcher exit flag; FULL RE-BOOT after
+        shutdown (the menu return path); manifest cached for
+        getAppProperty
+    props (MIDP 2.0 chain): sibling .jad overrides MANIFEST.MF;
+        manifest fallback when absent from the .jad; case-insensitive
+        keys; RFC-822 continuation unfolding across a CRLF+LF mix;
+        present-but-empty values; URL-TEMPLATE-GAME/URL-OPERATOR/
+        URL-PT non-null fallbacks; IGP-*/URL-* -> ""; unknown key ->
+        null; jad_load_sibling found/absent; shutdown wipes both
+        buffers (the GLLib catch-NPE stall after the Ubisoft splash)
+    diag: M: wraps the full "Class.method" onto a 6th strip row (no
+        14-char clip) and renders on fp_lcd_flush only — never
+        mid-SD-read; short M: stays a single row; 6th row used only
+        when the wrap needs it
+    sound: Sound.getState()I -> 1 (SOUND_STOPPED, never 0 PLAYING —
+        the 2.1 s/frame splash stall); full Sound + DeviceControl
+        surface registered incl. init([BI)V; exact-signature lookup
+        still misses unknown overloads (no over-stubbing)
+    ac1: setClip REPLACES (two glyph cells both rasterize); black
+        fill is OPAQUE and a black blit REPLACES the target; mutable
+        images start WHITE; fillTriangle rasterizes (and survives a
+        degenerate zero-height call); getRecord(id,buf,off) copies
+        at an offset and returns the length; System.out/.err are
+        real stub objects; Thread.yield is registered (pumps)
+    input: MIDP keycodes keep their sign through the event queue
+        (SOFT1 -6 no longer arrives as 250 — the AC1 soft keys)
+    cache: 2nd execution of a static method goes through the
+        per-class cp_cache (field ops + InvokeSite memo) and returns
+        the identical result; native dispatch + getstatic/putstatic
+        re-run through the cached JField/InvokeSite paths
+    lcd (the portrait scanout fix, fpj_lcd.h): the exact it2163
+        state (fpdoom --rotate 3 landscape 160x128, MADCTL 0xB0)
+        reprogrammed to native portrait MADCTL 0xD0, CASET 0..127,
+        RASET 0..159, w1/h1/w2/h2 = 128x160; rotate-1/rotate-2/
+        native-rotate-0 give the same window; the GC9106 RGB-order
+        bit is preserved; GRAM offsets +2/+1 land in CASET/RASET;
+        mono/--mac and 240x320 panels fall back to letterbox
+        untouched; the plan is stateless (re-pin stable — clean
+        flush state); fp_screen is exactly 40,960 bytes = 128*160*2
+        with a 256-byte row stride; fills land row-major at
+        fp_screen[y*128+x] with exact bounds; a flush leaves the
+        frame intact
+    lcd-gate (the (7) refresh program): DEFAULT SPI and LCM =
+        LCDC_WAIT,SUBMIT with ZERO per-frame register steps (the
+        (4)/(5)/(6) bug shape pinned); stream length == window
+        area == 20480 (pointer wraps to (0,0) with no re-pin);
+        plan-not-applied keeps the wait; mono = SKIP; opt-in
+        gram_repin keeps TX_END-before-commands + RAMWR-last (SPI)
+        and the DBI busy bit (LCM); the flag toggles off->on->off
+        purely; the 544 = 4x128+32 wrap signature; zero-origin
+        window
+    key (the (5) D-pad fix): fpj_key_rotate clears ONLY the keypad
+        bits of sys_data.rotate when portrait applied (0x33 -> 0x03);
+        the uncleared rotate-3 bug demo (UP -> LEFT etc.) and the
+        fixed full chain raw -> num_turn -> KP_* -> MIDP -1..-7;
+        CENTER/soft keys never rotate; digits upright in portrait
+    VM (AC1 regression, Gameloft-shaped): startApp BLOCKS inside a
+        repaint()+serviceRepaints()+Thread.sleep() loop and must get
+        6 paints delivered WHILE BLOCKING — asserted per delivery
+        path (serviceRepaints synchronous delivery AND the pumping
+        sleep), with spin counters proving early exit, not timeout;
+        a missing library native (String.equalsIgnoreCase) asserted
+        to degrade to a zero no-op WITHOUT panicking
+    font: launcher glyph drawing + selection bar
+    GC: garbage reclaimed, pinned survivors, handle invalidation
+  STATUS: 172/172 PASS (170 unit + 36KB-stack boots of the smoke
+  jar and a 24-deep superchain jar).
+    VISIBLE M1 CYCLE (the same classfiles the phone runs): startApp ->
+      Display.setCurrent -> paint() through the interpreter (green box,
+      black clear, drawString, drawRect border — asserted pixel-exact),
+      keyPressed -> repaint (box turns red), RSOFT -> notifyDestroyed
+      -> exit flag.
+
+Milestones
+----------
+  M0  DONE — arena, libc shims, host build green; on-target PNG+blit.
+  M1  DONE — parser, 202-opcode interpreter, GC, native registry,
+              MIDlet bootstrap; HelloWorld-class runs on host.
+  M1.5 DONE — launcher jar menu, manifest boot, per-suite RMS,
+              midlet-exit -> VM reset -> menu return, error screens.
+  M2  NEXT — exceptions, cooperative threads, boot.jar (real
+              java.lang/java.util), RecordEnumeration, first Gameloft
+              menu boot.
+  M3  boot Assassin's Creed (128x160 build) end-to-end.
+  M4  perf: dirty-rect flush, ARM asm blit, GC tuning.
+
+External references
+-------------------
+  fpdoom      https://github.com/ilyakurdyukov/fpdoom   (Unlicense)
+  sdboot      fpdoom/tree/main/sdboot — FAT32 only, LIBC_SDIO=3, CHIP=1
+  miniz       https://github.com/richgel999/miniz  3.0.2 (MIT)
+  stb_image   https://github.com/nothings/stb      2.34 (MIT/PD)
+  JSR-118     docs.oracle.com/javame/config/cldc/ref-impl/midp2.0/jsr118
+  preverify   commercial jars ship preverified already; for your own
+              test MIDlets use Oracle WTK 2.5.2 preverify
+
+License: your call — suggested MIT for fpj2me code; vendor files keep
+their own licenses (miniz MIT, stb MIT/PD, font8x8 PD).
